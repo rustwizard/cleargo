@@ -3,6 +3,7 @@ package pg
 import (
 	"context"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/jackc/pgx/v4"
@@ -14,6 +15,14 @@ const (
 	maxRetry = 10
 	ttlRetry = 1 * time.Second
 )
+
+var zLevels = map[pgx.LogLevel]zerolog.Level{
+	pgx.LogLevelDebug: zerolog.DebugLevel,
+	pgx.LogLevelInfo:  zerolog.InfoLevel,
+	pgx.LogLevelWarn:  zerolog.WarnLevel,
+	pgx.LogLevelError: zerolog.ErrorLevel,
+	pgx.LogLevelNone:  zerolog.NoLevel,
+}
 
 type Config struct {
 	Host         string `mapstructure:"HOST"`
@@ -31,8 +40,8 @@ type DB struct {
 	log  zerolog.Logger
 }
 
-func NewDB(log zerolog.Logger) *DB {
-	return &DB{log: log}
+func NewDB() *DB {
+	return &DB{log: zerolog.New(os.Stdout).With().Str("pkg", "postgres").Logger()}
 }
 
 func (d *DB) Connect(dbc *Config) error {
@@ -52,7 +61,7 @@ func (d *DB) Connect(dbc *Config) error {
 	}
 
 	poolConfig.BeforeAcquire = d.CheckConn
-
+	poolConfig.ConnConfig.Logger = d
 	var db *pgxpool.Pool
 	retry := 1
 	for retry < maxRetry {
@@ -102,4 +111,19 @@ func (d *DB) CheckConn(ctx context.Context, pgc *pgx.Conn) bool {
 	}
 
 	return pgc != nil
+}
+
+func (d *DB) Log(ctx context.Context, level pgx.LogLevel, msg string, data map[string]interface{}) {
+	lvl, _ := fromZLevel(level)
+	logger := d.log.With().Fields(data).Logger()
+	logger.WithLevel(lvl).Msg(msg)
+}
+
+func fromZLevel(level pgx.LogLevel) (zerolog.Level, pgx.LogLevel) {
+	zlvl, found := zLevels[level]
+	if found {
+		return zlvl, level
+	}
+
+	return zerolog.NoLevel, pgx.LogLevelNone
 }
