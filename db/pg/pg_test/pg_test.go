@@ -2,14 +2,12 @@ package pg_test
 
 import (
 	"net"
-	"os"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgmock"
 	"github.com/jackc/pgproto3/v2"
-	"github.com/rs/zerolog"
-	"github.com/rustwizard/ethstat/internal/pg"
+	"github.com/rustwizard/cleargo/db/pg"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -46,8 +44,7 @@ func TestConnect(t *testing.T) {
 		}
 	}()
 
-	log := zerolog.New(os.Stdout)
-	db := pg.NewDB(log)
+	db := pg.NewDB()
 	err = db.Connect(&pg.Config{
 		Host:         "127.0.0.1",
 		Port:         65432,
