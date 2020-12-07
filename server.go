@@ -1,6 +1,10 @@
 package cleargo
 
-import "github.com/labstack/echo/v4"
+import (
+	"context"
+
+	"github.com/labstack/echo/v4"
+)
 
 type HTTPServer struct {
 	addr string
@@ -16,4 +20,8 @@ func NewHTTPServer(addr string) *HTTPServer {
 
 func (s *HTTPServer) Run() error {
 	return s.e.Start(s.addr)
+}
+
+func (s *HTTPServer) Shutdown(ctx context.Context) error {
+	return s.e.Shutdown(ctx)
 }
