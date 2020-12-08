@@ -7,21 +7,21 @@ import (
 )
 
 type HTTPServer struct {
+	*echo.Echo
 	addr string
-	e    *echo.Echo
 }
 
 func NewHTTPServer(addr string) *HTTPServer {
 	return &HTTPServer{
-		e:    echo.New(),
+		Echo: echo.New(),
 		addr: addr,
 	}
 }
 
 func (s *HTTPServer) Run() error {
-	return s.e.Start(s.addr)
+	return s.Start(s.addr)
 }
 
 func (s *HTTPServer) Shutdown(ctx context.Context) error {
-	return s.e.Shutdown(ctx)
+	return s.Echo.Shutdown(ctx)
 }
