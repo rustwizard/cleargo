@@ -16,6 +16,7 @@ func TestConnect(t *testing.T) {
 	script := &pgmock.Script{
 		Steps: pgmock.AcceptUnauthenticatedConnRequestSteps(),
 	}
+	script.Steps = append(script.Steps, pgmock.ExpectMessage(&pgproto3.Terminate{}))
 	ln, err := net.Listen("tcp4", "127.0.0.1:65432")
 	require.NoError(t, err)
 	defer ln.Close()
@@ -56,6 +57,6 @@ func TestConnect(t *testing.T) {
 		MaxPoolSize:  10,
 	})
 	require.NoError(t, err)
-
+	db.Close()
 	assert.NoError(t, <-serverErrChan)
 }
