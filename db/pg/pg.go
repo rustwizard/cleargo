@@ -113,6 +113,10 @@ func (d *DB) CheckConn(ctx context.Context, pgc *pgx.Conn) bool {
 	return pgc != nil
 }
 
+func (d *DB) Close() {
+	d.Pool.Close()
+}
+
 func (d *DB) Log(ctx context.Context, level pgx.LogLevel, msg string, data map[string]interface{}) {
 	lvl, _ := fromZLevel(level)
 	logger := d.log.With().Fields(data).Logger()
