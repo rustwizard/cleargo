@@ -6,9 +6,12 @@ import (
 	"os"
 	"time"
 
-	"github.com/jackc/pgx/v4"
-	"github.com/jackc/pgx/v4/pgxpool"
+	"github.com/jackc/pgx/v5/tracelog"
+
 	"github.com/rs/zerolog"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 const (
@@ -16,12 +19,12 @@ const (
 	ttlRetry = 1 * time.Second
 )
 
-var zLevels = map[pgx.LogLevel]zerolog.Level{
-	pgx.LogLevelDebug: zerolog.DebugLevel,
-	pgx.LogLevelInfo:  zerolog.InfoLevel,
-	pgx.LogLevelWarn:  zerolog.WarnLevel,
-	pgx.LogLevelError: zerolog.ErrorLevel,
-	pgx.LogLevelNone:  zerolog.NoLevel,
+var zLevels = map[tracelog.LogLevel]zerolog.Level{
+	tracelog.LogLevelDebug: zerolog.DebugLevel,
+	tracelog.LogLevelInfo:  zerolog.InfoLevel,
+	tracelog.LogLevelWarn:  zerolog.WarnLevel,
+	tracelog.LogLevelError: zerolog.ErrorLevel,
+	tracelog.LogLevelNone:  zerolog.NoLevel,
 }
 
 type Config struct {
@@ -36,12 +39,13 @@ type Config struct {
 }
 
 type DB struct {
-	Pool *pgxpool.Pool
-	log  zerolog.Logger
+	Pool   *pgxpool.Pool
+	logger zerolog.Logger
 }
 
 func NewDB() *DB {
-	return &DB{log: zerolog.New(os.Stdout).With().Str("pkg", "postgres").Logger()}
+	zlogger := zerolog.New(os.Stdout).With().Str("pkg", "postgres").Logger()
+	return &DB{logger: zlogger}
 }
 
 func (d *DB) Connect(dbc *Config) error {
@@ -56,18 +60,18 @@ func (d *DB) Connect(dbc *Config) error {
 	)
 	poolConfig, err := pgxpool.ParseConfig(args)
 	if err != nil {
-		d.log.Error().Err(err).Msg("parse config")
+		d.logger.Error().Err(err).Msg("parse config")
 		return err
 	}
 
 	poolConfig.BeforeAcquire = d.CheckConn
-	poolConfig.ConnConfig.Logger = d
+
 	var db *pgxpool.Pool
 	retry := 1
 	for retry < maxRetry {
-		db, err = pgxpool.ConnectConfig(context.Background(), poolConfig)
+		db, err = pgxpool.NewWithConfig(context.Background(), poolConfig)
 		if err != nil {
-			d.log.Error().Err(err).Int("retry", retry).
+			d.logger.Error().Err(err).Int("retry", retry).
 				Dur("second", ttlRetry+(1<<retry)*time.Second).Msg("")
 			retry++
 			time.Sleep(ttlRetry + (1<<retry)*time.Second)
@@ -92,16 +96,16 @@ func (d *DB) CheckConn(ctx context.Context, pgc *pgx.Conn) bool {
 
 		for range ticker.C {
 			if attempt >= maxRetry {
-				d.log.Info().Msg("postgres: max reconnect attempt")
+				d.logger.Info().Msg("postgres: max reconnect attempt")
 				return false
 			}
 			attempt++
 
-			d.log.Info().Msg("postgres: try to reconnect")
+			d.logger.Info().Msg("postgres: try to reconnect")
 
 			newPgc, connErr := d.Pool.Acquire(ctx)
 			if connErr != nil {
-				d.log.Error().Err(err).Msg("postgres: lost connection")
+				d.logger.Error().Err(err).Msg("postgres: lost connection")
 				continue
 			}
 
@@ -117,17 +121,17 @@ func (d *DB) Close() {
 	d.Pool.Close()
 }
 
-func (d *DB) Log(ctx context.Context, level pgx.LogLevel, msg string, data map[string]interface{}) {
+func (d *DB) Log(ctx context.Context, level tracelog.LogLevel, msg string, data map[string]interface{}) {
 	lvl, _ := fromZLevel(level)
-	logger := d.log.With().Fields(data).Logger()
+	logger := d.logger.With().Fields(data).Logger()
 	logger.WithLevel(lvl).Msg(msg)
 }
 
-func fromZLevel(level pgx.LogLevel) (zerolog.Level, pgx.LogLevel) {
+func fromZLevel(level tracelog.LogLevel) (zerolog.Level, tracelog.LogLevel) {
 	zlvl, found := zLevels[level]
 	if found {
 		return zlvl, level
 	}
 
-	return zerolog.NoLevel, pgx.LogLevelNone
+	return zerolog.NoLevel, tracelog.LogLevelNone
 }
