@@ -5,7 +5,6 @@ go 1.18
 require (
 	github.com/jackc/pgmock v0.0.0-20210724152146-4ad1a8207f65
 	github.com/jackc/pgproto3/v2 v2.2.0
-	github.com/jackc/pgx-zerolog v0.0.0-20230124015146-7c83b3e9b2bd
 	github.com/jackc/pgx/v5 v5.3.1
 	github.com/labstack/echo/v4 v4.7.2
 	github.com/rs/zerolog v1.28.0
