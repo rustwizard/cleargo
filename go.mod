@@ -1,6 +1,6 @@
 module github.com/rustwizard/cleargo
 
-go 1.18
+go 1.20
 
 require (
 	github.com/jackc/pgmock v0.0.0-20210724152146-4ad1a8207f65
