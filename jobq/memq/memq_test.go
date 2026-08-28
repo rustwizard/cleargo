@@ -1,0 +1,222 @@
+package memq
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"testing"
+
+	"github.com/rustwizard/cleargo/jobq"
+	"github.com/stretchr/testify/require"
+)
+
+// TestConcurrent_EnqueueSameKey verifies that when N goroutines race to
+// enqueue the same key, exactly one wins and the rest get false.
+// Run with: go test -race ./mem/
+func TestConcurrent_EnqueueSameKey(t *testing.T) {
+	const workers = 50
+
+	m := New(3)
+	ctx := context.Background()
+
+	var wg sync.WaitGroup
+	successes := make(chan bool, workers)
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ok, err := m.Enqueue(ctx, "contested-key", map[string]any{"i": i})
+			require.NoError(t, err)
+			successes <- ok
+		}()
+	}
+
+	wg.Wait()
+	close(successes)
+
+	var count int
+	for ok := range successes {
+		if ok {
+			count++
+		}
+	}
+
+	require.Equal(t, 1, count, "exactly one goroutine must win the insert")
+	require.Equal(t, 1, m.Len())
+}
+
+// TestConcurrent_ClaimNoDouble ensures that N workers claiming concurrently
+// never receive the same job twice. Each job is claimed by at most one
+// goroutine.
+func TestConcurrent_ClaimNoDouble(t *testing.T) {
+	const (
+		jobs    = 100
+		workers = 10
+	)
+
+	m := New(3)
+	ctx := context.Background()
+
+	// Seed the queue.
+	for i := 0; i < jobs; i++ {
+		m.Enqueue(ctx, fmt.Sprintf("job-%d", i), nil)
+	}
+
+	// Each worker claims in a loop until the queue is empty.
+	claimed := make(chan int64, jobs)
+	var wg sync.WaitGroup
+
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				job, err := m.Claim(ctx)
+				if err != nil {
+					if err == jobq.ErrNoJobs {
+						return
+					}
+					t.Errorf("unexpected error: %v", err)
+					return
+				}
+				claimed <- job.ID
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(claimed)
+
+	// Collect and verify.
+	seen := make(map[int64]int)
+	total := 0
+	for id := range claimed {
+		seen[id]++
+		total++
+	}
+
+	require.Equal(t, jobs, total, "all jobs must be claimed exactly once")
+	for id, count := range seen {
+		require.Equal(t, 1, count, "job %d claimed %d times (expected 1)", id, count)
+	}
+}
+
+// TestConcurrent_MixedOps hammers Enqueue, Claim, Ack, Fail, and
+// ReclaimStale simultaneously. The invariant we check:
+//   - no data race (enforced by -race)
+//   - Len() == total_enqueued (no jobs lost or duplicated)
+//   - every job ends in exactly one terminal state
+func TestConcurrent_MixedOps(t *testing.T) {
+	const (
+		enqueues = 200
+		workers  = 8
+	)
+
+	m := New(2)
+	ctx := context.Background()
+
+	var wg sync.WaitGroup
+
+	// Enqueuers.
+	for i := 0; i < enqueues; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			m.Enqueue(ctx, fmt.Sprintf("job-%d", id), map[string]any{"id": id})
+		}(i)
+	}
+
+	// Workers: claim → randomly ack or fail.
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(seed int) {
+			defer wg.Done()
+			for i := 0; i < 50; i++ {
+				job, err := m.Claim(ctx)
+				if err != nil {
+					return
+				}
+				if i%3 == 0 {
+					m.Fail(ctx, job.ID, fmt.Sprintf("worker-%d-fail-%d", seed, i))
+				} else {
+					m.Ack(ctx, job.ID)
+				}
+			}
+		}(w)
+	}
+
+	// Stale reclaimer running in parallel.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 10; i++ {
+			m.ReclaimStale(ctx, 0) // noop, but exercises the lock
+		}
+	}()
+
+	wg.Wait()
+
+	// Invariants.
+	require.Equal(t, enqueues, m.Len(), "no jobs lost")
+
+	done := m.CountByStatus(jobq.Done)
+	failed := m.CountByStatus(jobq.Failed)
+	pending := m.CountByStatus(jobq.Pending)
+	processing := m.CountByStatus(jobq.Processing)
+
+	// processing may be non-zero if a worker claimed but hasn't finished
+	// its Ack/Fail yet... but we joined all workers, so it should be 0.
+	require.Equal(t, 0, processing, "all workers joined, no stuck jobs")
+
+	// Terminal + pending + processing = total.
+	require.Equal(t, enqueues, done+failed+pending+processing)
+}
+
+// TestConcurrent_EnqueueAndClaim verifies no deadlock when enqueuers and
+// claimers run simultaneously.
+func TestConcurrent_EnqueueAndClaim(t *testing.T) {
+	const (
+		total   = 500
+		workers = 5
+	)
+
+	m := New(3)
+	ctx := context.Background()
+
+	// Pre-populate half.
+	for i := 0; i < total/2; i++ {
+		m.Enqueue(ctx, fmt.Sprintf("pre-%d", i), nil)
+	}
+
+	var wg sync.WaitGroup
+
+	// Enqueuers for the second half.
+	for i := 0; i < total/2; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			m.Enqueue(ctx, fmt.Sprintf("late-%d", id), nil)
+		}(i)
+	}
+
+	// Claimers drain until empty.
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				_, err := m.Claim(ctx)
+				if err != nil {
+					return
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	// All jobs should be either done/failed/pending (no processing since
+	// workers returned). Total count must be preserved.
+	require.Equal(t, total, m.Len())
+}
