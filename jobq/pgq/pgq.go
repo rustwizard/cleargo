@@ -1,8 +1,12 @@
-// Package postgres implements jobq.Queue on top of PostgreSQL using
+// Package pgq implements jobq.Queue on top of PostgreSQL using
 // SELECT ... FOR UPDATE SKIP LOCKED for concurrent-safe claiming.
 //
-// The target table must exist before calling New(). See schema.sql in this
-// package for the expected DDL. The module does NOT auto-migrate.
+// The target table must exist before calling New(). Apply the embedded
+// migrations first:
+//
+//	_, err := pgq.Migrate(ctx, pool)
+//
+// The module does NOT auto-migrate on New().
 package pgq
 
 import (
