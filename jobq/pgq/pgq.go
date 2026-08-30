@@ -46,6 +46,17 @@ type Config struct {
 	// Default: 5 * time.Minute.
 	StaleAfter time.Duration
 
+	// RetryBase is the base delay of the exponential backoff applied to
+	// failed jobs before they become claimable again. The delay after
+	// attempt N is RetryBase * 2^(N-1), capped at RetryCap.
+	// A value <= 0 (the default) disables the backoff: failed jobs are
+	// immediately claimable again.
+	RetryBase time.Duration
+
+	// RetryCap caps the exponential backoff delay.
+	// Default: 1 minute (only used when RetryBase > 0).
+	RetryCap time.Duration
+
 	// Metrics is a Prometheus registerer for queue metrics. When non-nil the
 	// queue registers a collector exposing:
 	//
@@ -67,6 +78,14 @@ func (c Config) withDefaults() Config {
 	if c.StaleAfter <= 0 {
 		c.StaleAfter = 5 * time.Minute
 	}
+	// RetryBase <= 0 disables the retry backoff entirely (immediate retry).
+	if c.RetryBase <= 0 {
+		c.RetryBase = 0
+		c.RetryCap = 0
+	}
+	if c.RetryBase > 0 && c.RetryCap <= 0 {
+		c.RetryCap = time.Minute
+	}
 	return c
 }
 
@@ -76,6 +95,8 @@ type Postgres struct {
 	table       string // validated, safe to interpolate
 	maxAttempts int
 	staleAfter  time.Duration
+	retryBase   time.Duration // <= 0 disables backoff
+	retryCap    time.Duration
 	metrics     *queueMetrics // nil when metrics are disabled
 }
 
@@ -97,6 +118,8 @@ func New(db DB, cfg Config) (*Postgres, error) {
 		table:       cfg.Table,
 		maxAttempts: cfg.MaxAttempts,
 		staleAfter:  cfg.StaleAfter,
+		retryBase:   cfg.RetryBase,
+		retryCap:    cfg.RetryCap,
 	}
 
 	if cfg.Metrics != nil {
@@ -172,6 +195,7 @@ func (p *Postgres) Claim(ctx context.Context) (*jobq.Job, error) {
 			SELECT id FROM `+p.table+`
 			WHERE status = 'pending'
 			  AND attempts < max_attempts
+			  AND run_after <= now()
 			ORDER BY id ASC
 			LIMIT 1
 			FOR UPDATE SKIP LOCKED
@@ -232,6 +256,10 @@ func (p *Postgres) Ack(ctx context.Context, id int64) error {
 // max_attempts it is put back to pending for retry; otherwise it transitions
 // to the terminal "failed" state.
 //
+// A non-terminal failure schedules the next retry with an exponential backoff:
+// the job becomes claimable again after RetryBase * 2^(attempts-1), capped at
+// RetryCap. A RetryBase <= 0 makes the job immediately claimable again.
+//
 // The error message is truncated to 2000 characters to keep the table tidy.
 // Truncation is rune-safe so multibyte (e.g. Cyrillic) text is never cut mid-rune.
 func (p *Postgres) Fail(ctx context.Context, id int64, errMsg string) error {
@@ -244,9 +272,14 @@ func (p *Postgres) Fail(ctx context.Context, id int64, errMsg string) error {
 		SET status      = CASE WHEN attempts >= max_attempts THEN 'failed' ELSE 'pending' END,
 		    error       = $2,
 		    started_at  = NULL,
-		    finished_at = CASE WHEN attempts >= max_attempts THEN now() ELSE NULL END
+		    finished_at = CASE WHEN attempts >= max_attempts THEN now() ELSE NULL END,
+		    run_after   = CASE
+		                      WHEN attempts >= max_attempts THEN run_after
+		                      ELSE now() + make_interval(secs =>
+		                          LEAST($3::float8 * power(2, attempts - 1)::float8, $4::float8))
+		                  END
 		WHERE id = $1 AND status = 'processing'
-	`, id, errMsg)
+	`, id, errMsg, p.retryBase.Seconds(), p.retryCap.Seconds())
 	if err != nil {
 		return fmt.Errorf("pgq: fail job %d: %w", id, err)
 	}
@@ -277,7 +310,8 @@ func (p *Postgres) ReclaimStale(ctx context.Context, timeout time.Duration) (int
 		UPDATE `+p.table+`
 		SET status     = 'pending',
 		    started_at = NULL,
-		    error      = NULL
+		    error      = NULL,
+		    run_after  = now()
 		WHERE status = 'processing'
 		  AND started_at < now() - make_interval(secs => $1)
 	`, float64(timeout.Seconds()))
@@ -327,12 +361,12 @@ func (p *Postgres) Stats(ctx context.Context) (jobq.Stats, error) {
 }
 
 // Depth returns the number of jobs Claim can hand out right now
-// (pending and not yet exhausted their attempts).
+// (pending, not yet exhausted their attempts, and past their backoff delay).
 func (p *Postgres) Depth(ctx context.Context) (int, error) {
 	var n int
 	err := p.db.QueryRowContext(ctx, `
 		SELECT count(*) FROM `+p.table+`
-		WHERE status = 'pending' AND attempts < max_attempts
+		WHERE status = 'pending' AND attempts < max_attempts AND run_after <= now()
 	`).Scan(&n)
 	if err != nil {
 		return 0, fmt.Errorf("pgq: depth: %w", err)
