@@ -25,3 +25,15 @@ func TestMigrate(t *testing.T) {
 
 	t.Log("version", ver)
 }
+
+func TestMigrate_ZeroTimeout(t *testing.T) {
+	_, err := Migrate(context.Background(), "postgres://user:pass@127.0.0.1:5432/db", 0)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "timeout must be positive")
+}
+
+func TestMigrate_InvalidDSN(t *testing.T) {
+	// Unreachable endpoint: connection must fail fast, not hang.
+	_, err := Migrate(context.Background(), "postgres://user:pass@127.0.0.1:1/none?sslmode=disable", 2*time.Second)
+	require.Error(t, err)
+}

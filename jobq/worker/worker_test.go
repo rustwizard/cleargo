@@ -194,3 +194,35 @@ func TestWorker_NilHandler(t *testing.T) {
 	w := worker.New(m, worker.Config{}, nil)
 	require.Error(t, w.Run(context.Background()))
 }
+
+// TestWorker_CancelsHandlerOnLostLease verifies that when heartbeats stop
+// being accepted (the lease lapsed), the worker cancels the in-flight
+// handler instead of silently continuing on a job that may be re-claimed.
+func TestWorker_CancelsHandlerOnLostLease(t *testing.T) {
+	m := memq.New(3)
+	m.SetLease(20 * time.Millisecond)
+	_, _ = m.Enqueue(context.Background(), "lease-lost", nil)
+
+	handlerCanceled := make(chan struct{})
+	w := worker.New(m, worker.Config{
+		Workers:           1,
+		PollInterval:      5 * time.Millisecond,
+		HeartbeatInterval: 100 * time.Millisecond, // slower than the lease: lost
+	}, func(ctx context.Context, _ *jobq.Job) error {
+		<-ctx.Done()
+		close(handlerCanceled)
+		return ctx.Err()
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- w.Run(ctx) }()
+
+	select {
+	case <-handlerCanceled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler was not cancelled after lease loss")
+	}
+	cancel()
+	require.NoError(t, <-done)
+}

@@ -405,3 +405,20 @@ func TestRetryCap(t *testing.T) {
 	require.Equal(t, 250*time.Millisecond, m.backoffDelay(3)) // 400ms capped
 	require.Equal(t, 250*time.Millisecond, m.backoffDelay(10))
 }
+
+func TestMaxAttempts(t *testing.T) {
+	require.Equal(t, 3, New(0).MaxAttempts())
+	require.Equal(t, 7, New(7).MaxAttempts())
+}
+
+func TestGetByKey(t *testing.T) {
+	m := New(3)
+	_, err := m.Enqueue(context.Background(), "k1", map[string]any{"a": 1})
+	require.NoError(t, err)
+
+	j := m.GetByKey("k1")
+	require.NotNil(t, j)
+	require.Equal(t, "k1", j.Key)
+	require.Equal(t, map[string]any{"a": 1}, j.Payload)
+	require.Nil(t, m.GetByKey("missing"))
+}

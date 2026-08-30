@@ -957,3 +957,75 @@ func TestHeartbeat_RenewsLease(t *testing.T) {
 	require.NoError(t, err)
 	require.Greater(t, after, before, "heartbeat must push lease_until forward")
 }
+
+func TestStaleAfter(t *testing.T) {
+	q, err := New(noopDB{}, Config{StaleAfter: 42 * time.Second})
+	require.NoError(t, err)
+	require.Equal(t, 42*time.Second, q.StaleAfter())
+
+	q, err = New(noopDB{}, Config{})
+	require.NoError(t, err)
+	require.Equal(t, 5*time.Minute, q.StaleAfter())
+}
+
+func TestEnqueue_MarshalError(t *testing.T) {
+	q, err := New(noopDB{}, Config{})
+	require.NoError(t, err)
+	_, err = q.Enqueue(context.Background(), "bad", map[string]any{"ch": make(chan int)})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "marshal payload")
+}
+
+func TestCanceledContext(t *testing.T) {
+	q, _ := newQueue(t, Config{})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already canceled
+
+	_, err := q.Enqueue(ctx, "x", nil)
+	require.Error(t, err)
+	_, err = q.Claim(ctx)
+	require.Error(t, err)
+	err = q.Ack(ctx, 1)
+	require.Error(t, err)
+	err = q.Fail(ctx, 1, "x")
+	require.Error(t, err)
+	err = q.Heartbeat(ctx, 1)
+	require.Error(t, err)
+	_, err = q.ReclaimStale(ctx, time.Second)
+	require.Error(t, err)
+	_, err = q.Stats(ctx)
+	require.Error(t, err)
+	_, err = q.Depth(ctx)
+	require.Error(t, err)
+}
+
+func TestMetrics_SharedRegistry(t *testing.T) {
+	reg := prometheus.NewRegistry()
+
+	q1, _ := newQueue(t, Config{Metrics: reg})
+	_, _ = q1.Enqueue(context.Background(), "a", nil)
+
+	// A second queue on the same registry must not conflict (label table
+	// keeps the series apart) and must be added to the shared collector.
+	q2, _ := newQueue(t, Config{Metrics: reg})
+	_, _ = q2.Enqueue(context.Background(), "b", nil)
+
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+	require.Equal(t, 1.0, gaugeValue(mfs, "jobq_jobs_by_status", q1.table, "pending"))
+	require.Equal(t, 1.0, gaugeValue(mfs, "jobq_jobs_by_status", q2.table, "pending"))
+}
+
+func TestNew_MetricsRegistrationConflict(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	// Pre-register a metric with the same name to force AlreadyRegistered.
+	conflict := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "jobq", Name: "ops_total", Help: "conflict",
+	}, []string{"table", "op"})
+	require.NoError(t, reg.Register(conflict))
+
+	q, _ := newQueue(t, Config{})
+	_, err := New(q.db, Config{Table: q.table, Metrics: reg})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "register collector")
+}
