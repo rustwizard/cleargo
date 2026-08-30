@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/rustwizard/cleargo/jobq"
 	"github.com/stretchr/testify/require"
@@ -285,4 +286,42 @@ func TestStats(t *testing.T) {
 	depth, err = m.Depth(ctx)
 	require.NoError(t, err)
 	require.Equal(t, 1, depth)
+}
+
+func TestBackoff(t *testing.T) {
+	m := New(3)
+	m.SetRetryBase(50 * time.Millisecond)
+	ctx := context.Background()
+
+	ok, err := m.Enqueue(ctx, "bk", nil)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	job, err := m.Claim(ctx)
+	require.NoError(t, err)
+	require.NoError(t, m.Fail(ctx, job.ID, "e1"))
+
+	// Deferred: not claimable and not counted in depth.
+	depth, err := m.Depth(ctx)
+	require.NoError(t, err)
+	require.Zero(t, depth)
+	_, err = m.Claim(ctx)
+	require.ErrorIs(t, err, jobq.ErrNoJobs)
+
+	// After the backoff elapses the job is claimable again (attempt 2).
+	time.Sleep(120 * time.Millisecond)
+	job, err = m.Claim(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 2, job.Attempts)
+
+	// Without a retry base the backoff is disabled (immediate retry).
+	m2 := New(3)
+	_, _ = m2.Enqueue(ctx, "bk2", nil)
+	j2, err := m2.Claim(ctx)
+	require.NoError(t, err)
+	require.NoError(t, m2.Fail(ctx, j2.ID, "e2"))
+	require.NoError(t, err)
+	j2, err = m2.Claim(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 2, j2.Attempts)
 }

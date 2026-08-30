@@ -167,12 +167,20 @@ func newQueue(t *testing.T, cfg Config) (*Postgres, *sql.DB) {
 	_, err = db.ExecContext(ctx, "DROP TABLE IF EXISTS "+cfg.Table)
 	require.NoError(t, err)
 
-	// Load the embedded migration and replace the table name.
-	raw, err := migrations.ReadFile("000001_init.sql")
+	// Apply all embedded migrations in order (embed.FS lists entries sorted
+	// by name), replacing the default table name with the test-specific one.
+	entries, err := migrations.ReadDir(".")
 	require.NoError(t, err)
-	ddl := strings.ReplaceAll(string(raw), "jobq_jobs", cfg.Table)
-	_, err = db.ExecContext(ctx, ddl)
-	require.NoError(t, err)
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".sql") {
+			continue
+		}
+		raw, err := migrations.ReadFile(e.Name())
+		require.NoError(t, err)
+		ddl := strings.ReplaceAll(string(raw), "jobq_jobs", cfg.Table)
+		_, err = db.ExecContext(ctx, ddl)
+		require.NoError(t, err)
+	}
 
 	q, err := New(db, cfg)
 	require.NoError(t, err)
@@ -187,6 +195,35 @@ func rowStatus(t *testing.T, db *sql.DB, table string, id int64) jobq.Status {
 	err := db.QueryRowContext(context.Background(), fmt.Sprintf("SELECT status FROM %s WHERE id=$1", table), id).Scan(&s)
 	require.NoError(t, err)
 	return s
+}
+
+// assertRunAfter checks that a failed job's run_after is approximately
+// `want` seconds in the future (generous tolerance for clock noise).
+func assertRunAfter(t *testing.T, db *sql.DB, table string, id int64, want time.Duration) {
+	t.Helper()
+	var secs float64
+	err := db.QueryRowContext(context.Background(), fmt.Sprintf(
+		"SELECT extract(epoch from (run_after - now()))::float8 FROM %s WHERE id=$1", table), id).Scan(&secs)
+	require.NoError(t, err)
+	require.InDelta(t, want.Seconds(), secs, want.Seconds()*0.5+0.05, "run_after for job %d", id)
+}
+
+// waitDepth polls q.Depth until it reaches want or timeout elapses.
+func waitDepth(t *testing.T, q *Postgres, want int, timeout time.Duration) {
+	t.Helper()
+	ctx := context.Background()
+	deadline := time.Now().Add(timeout)
+	last := -1
+	for time.Now().Before(deadline) {
+		d, err := q.Depth(ctx)
+		require.NoError(t, err)
+		last = d
+		if d == want {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("depth did not reach %d within %v (last=%d)", want, timeout, last)
 }
 
 // ---------------------------------------------------------------------------
@@ -210,30 +247,40 @@ func TestConfig_WithDefaults(t *testing.T) {
 		wantTable string
 		wantMax   int
 		wantStale time.Duration
+		wantBase  time.Duration
+		wantCap   time.Duration
 	}{{
 		name:      "zero",
 		in:        Config{},
-		wantTable: "jobq_jobs", wantMax: 3, wantStale: 5 * time.Minute,
+		wantTable: "jobq_jobs", wantMax: 3, wantStale: 5 * time.Minute, wantBase: 0, wantCap: 0,
 	}, {
 		name:      "custom table",
 		in:        Config{Table: "my_jobs"},
-		wantTable: "my_jobs", wantMax: 3, wantStale: 5 * time.Minute,
+		wantTable: "my_jobs", wantMax: 3, wantStale: 5 * time.Minute, wantBase: 0, wantCap: 0,
 	}, {
 		name:      "custom max",
 		in:        Config{MaxAttempts: 7},
-		wantTable: "jobq_jobs", wantMax: 7, wantStale: 5 * time.Minute,
+		wantTable: "jobq_jobs", wantMax: 7, wantStale: 5 * time.Minute, wantBase: 0, wantCap: 0,
 	}, {
 		name:      "custom stale",
 		in:        Config{StaleAfter: time.Second},
-		wantTable: "jobq_jobs", wantMax: 3, wantStale: time.Second,
+		wantTable: "jobq_jobs", wantMax: 3, wantStale: time.Second, wantBase: 0, wantCap: 0,
 	}, {
 		name:      "neg max -> default",
 		in:        Config{MaxAttempts: -1},
-		wantTable: "jobq_jobs", wantMax: 3, wantStale: 5 * time.Minute,
+		wantTable: "jobq_jobs", wantMax: 3, wantStale: 5 * time.Minute, wantBase: 0, wantCap: 0,
 	}, {
 		name:      "neg stale -> default",
 		in:        Config{StaleAfter: -time.Second},
-		wantTable: "jobq_jobs", wantMax: 3, wantStale: 5 * time.Minute,
+		wantTable: "jobq_jobs", wantMax: 3, wantStale: 5 * time.Minute, wantBase: 0, wantCap: 0,
+	}, {
+		name:      "custom backoff",
+		in:        Config{RetryBase: 250 * time.Millisecond, RetryCap: 2 * time.Second},
+		wantTable: "jobq_jobs", wantMax: 3, wantStale: 5 * time.Minute, wantBase: 250 * time.Millisecond, wantCap: 2 * time.Second,
+	}, {
+		name:      "neg backoff -> default",
+		in:        Config{RetryBase: -time.Second, RetryCap: -time.Second},
+		wantTable: "jobq_jobs", wantMax: 3, wantStale: 5 * time.Minute, wantBase: 0, wantCap: 0,
 	}}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -241,6 +288,8 @@ func TestConfig_WithDefaults(t *testing.T) {
 			require.Equal(t, tc.wantTable, got.Table)
 			require.Equal(t, tc.wantMax, got.MaxAttempts)
 			require.Equal(t, tc.wantStale, got.StaleAfter)
+			require.Equal(t, tc.wantBase, got.RetryBase)
+			require.Equal(t, tc.wantCap, got.RetryCap)
 		})
 	}
 }
@@ -283,10 +332,9 @@ func TestMigration_Schema(t *testing.T) {
 
 	var n int
 	// Verify expected columns exist in the core table.
-	q := `SELECT count(*) FROM information_schema.columns WHERE table_name='jobq_jobs' AND column_name IN ('id','key','payload','status','attempts','max_attempts','error','created_at','started_at','finished_at')`
-	err = db.QueryRowContext(ctx, q).Scan(&n)
-	require.NoError(t, err)
-	require.Equal(t, 10, n)
+	q := `SELECT count(*) FROM information_schema.columns WHERE table_name='jobq_jobs' AND column_name IN ('id','key','payload','status','attempts','max_attempts','error','created_at','started_at','finished_at','run_after')`
+	require.NoError(t, db.QueryRowContext(ctx, q).Scan(&n))
+	require.Equal(t, 11, n)
 	// Verify constraint and index.
 	err = db.QueryRowContext(ctx, `SELECT count(*) FROM pg_constraint WHERE conname='jobq_jobs_status_chk'`).Scan(&n)
 	require.NoError(t, err)
@@ -376,7 +424,7 @@ func TestClaim_NoJobs(t *testing.T) {
 }
 
 func TestFail_RetryThenTerminal(t *testing.T) {
-	q, db := newQueue(t, Config{MaxAttempts: 3})
+	q, db := newQueue(t, Config{MaxAttempts: 3, RetryBase: 0}) // backoff off: immediate retries
 	ctx := context.Background()
 	ok, err := q.Enqueue(ctx, "flaky", nil)
 	require.NoError(t, err)
@@ -432,6 +480,47 @@ func TestFail_Truncation(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 2000, utf8.RuneCountInString(stored), "exactly 2000 runes, no broken UTF-8")
 	require.True(t, utf8.ValidString(stored), "stored error must be valid UTF-8")
+}
+
+func TestFail_Backoff(t *testing.T) {
+	const (
+		base = 100 * time.Millisecond
+		cap  = 250 * time.Millisecond
+	)
+	q, db := newQueue(t, Config{MaxAttempts: 5, RetryBase: base, RetryCap: cap})
+	ctx := context.Background()
+
+	ok, err := q.Enqueue(ctx, "bk", nil)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	// Delays after attempt N: base*2^(N-1), capped at RetryCap.
+	expected := []time.Duration{base, 2 * base, cap, cap}
+
+	for i, want := range expected {
+		job, err := q.Claim(ctx)
+		require.NoError(t, err, "claim attempt %d", i+1)
+		require.Equal(t, i+1, job.Attempts)
+		require.NoError(t, q.Fail(ctx, job.ID, fmt.Sprintf("e%d", i+1)))
+
+		// The job is pending but deferred: not claimable until run_after.
+		assertRunAfter(t, db, q.table, job.ID, want)
+		depth, err := q.Depth(ctx)
+		require.NoError(t, err)
+		require.Zero(t, depth, "delayed job must not count towards depth")
+		_, err = q.Claim(ctx)
+		require.ErrorIs(t, err, jobq.ErrNoJobs, "delayed job must not be claimable")
+
+		// Wait for the backoff to elapse; the job becomes claimable again.
+		waitDepth(t, q, 1, want+2*time.Second)
+	}
+
+	// The fifth attempt exceeds max_attempts -> terminal failed.
+	job, err := q.Claim(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 5, job.Attempts)
+	require.NoError(t, q.Fail(ctx, job.ID, "final"))
+	require.Equal(t, jobq.Failed, rowStatus(t, db, q.table, job.ID))
 }
 
 func TestAck_NotProcessing(t *testing.T) {
@@ -577,7 +666,7 @@ func TestConcurrent_MixedOps(t *testing.T) {
 		enqueues = 300
 		workers  = 8
 	)
-	q, db := newQueue(t, Config{MaxAttempts: 3})
+	q, db := newQueue(t, Config{MaxAttempts: 3, RetryBase: 0})
 	ctx := context.Background()
 
 	errCh := make(chan error, enqueues+workers*100)
@@ -638,7 +727,7 @@ func TestConcurrent_MixedOps(t *testing.T) {
 }
 
 func TestStats(t *testing.T) {
-	q, _ := newQueue(t, Config{MaxAttempts: 2})
+	q, _ := newQueue(t, Config{MaxAttempts: 2, RetryBase: 0})
 	ctx := context.Background()
 
 	// Empty queue.

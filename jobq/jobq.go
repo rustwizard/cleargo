@@ -53,6 +53,8 @@ type Queue interface {
 
 	// Fail — задача упала. Если attempts < max → вернётся в pending (retry).
 	// Иначе → failed (мёртвая).
+	// Реализация может отложить повторный Claim (backoff): pgq делает это
+	// через Config.RetryBase/RetryCap, memq — через SetRetryBase.
 	Fail(ctx context.Context, id int64, errMsg string) error
 
 	// ReclaimStale возвращает в pending задачи, зависшие в processing

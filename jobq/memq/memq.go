@@ -27,6 +27,8 @@ type Mem struct {
 	nextID      int64
 	maxAttempts int
 	staleAfter  time.Duration
+	retryBase   time.Duration       // <= 0 disables backoff
+	retryAt     map[int64]time.Time // id → earliest claim time after a failed attempt
 }
 
 // New creates an in-memory queue. maxAttempts is stamped onto every job
@@ -50,11 +52,21 @@ func New(maxAttempts int, staleAfter ...time.Duration) *Mem {
 		nextID:      1,
 		maxAttempts: maxAttempts,
 		staleAfter:  sa,
+		retryAt:     make(map[int64]time.Time),
 	}
 }
 
 // MaxAttempts returns the configured retry limit (useful in test assertions).
 func (m *Mem) MaxAttempts() int { return m.maxAttempts }
+
+// SetRetryBase enables the exponential retry backoff: after a non-terminal
+// Fail the job becomes claimable again after RetryBase * 2^(attempts-1).
+// A value <= 0 (default) makes failed jobs immediately claimable.
+func (m *Mem) SetRetryBase(d time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.retryBase = d
+}
 
 // ---------------------------------------------------------------------------
 // jobq.Queue
@@ -108,6 +120,9 @@ func (m *Mem) Claim(_ context.Context) (*jobq.Job, error) {
 		if j.Attempts >= m.maxAttempts {
 			continue
 		}
+		if ra, ok := m.retryAt[j.ID]; ok && ra.After(time.Now().UTC()) {
+			continue // still in backoff
+		}
 		if target == nil || j.ID < target.ID {
 			target = j
 		}
@@ -121,6 +136,7 @@ func (m *Mem) Claim(_ context.Context) (*jobq.Job, error) {
 	target.Status = jobq.Processing
 	target.Attempts++
 	target.StartedAt = &now
+	delete(m.retryAt, target.ID)
 
 	// Shallow copy: caller gets an independent struct, but Payload map is
 	// shared. Acceptable for a test helper.
@@ -145,6 +161,7 @@ func (m *Mem) Ack(_ context.Context, id int64) error {
 	now := time.Now().UTC()
 	j.Status = jobq.Done
 	j.FinishedAt = &now // see note below
+	delete(m.retryAt, id)
 
 	return nil
 }
@@ -176,9 +193,16 @@ func (m *Mem) Fail(_ context.Context, id int64, errMsg string) error {
 		now := time.Now().UTC()
 		j.Status = jobq.Failed
 		j.FinishedAt = &now
+		delete(m.retryAt, id)
 	} else {
 		j.Status = jobq.Pending
 		j.FinishedAt = nil
+		if m.retryBase > 0 {
+			delay := m.retryBase * time.Duration(1<<uint(j.Attempts-1))
+			m.retryAt[id] = time.Now().UTC().Add(delay)
+		} else {
+			delete(m.retryAt, id)
+		}
 	}
 
 	return nil
@@ -210,6 +234,7 @@ func (m *Mem) ReclaimStale(_ context.Context, timeout time.Duration) (int64, err
 			j.Status = jobq.Pending
 			j.StartedAt = nil
 			j.Error = ""
+			delete(m.retryAt, j.ID) // reclaimed jobs become claimable immediately
 			count++
 		}
 	}
@@ -239,16 +264,22 @@ func (m *Mem) Stats(_ context.Context) (jobq.Stats, error) {
 }
 
 // Depth returns the number of jobs Claim can hand out right now
-// (pending and not yet exhausted their attempts), matching Claim's logic.
+// (pending, not yet exhausted their attempts, and past their backoff),
+// matching Claim's logic.
 func (m *Mem) Depth(_ context.Context) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	now := time.Now().UTC()
 	var n int
 	for _, j := range m.jobs {
-		if j.Status == jobq.Pending && j.Attempts < m.maxAttempts {
-			n++
+		if j.Status != jobq.Pending || j.Attempts >= m.maxAttempts {
+			continue
 		}
+		if ra, ok := m.retryAt[j.ID]; ok && ra.After(now) {
+			continue
+		}
+		n++
 	}
 	return n, nil
 }
