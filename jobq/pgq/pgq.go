@@ -4,7 +4,7 @@
 // The target table must exist before calling New(). Apply the embedded
 // migrations first:
 //
-//	_, err := pgq.Migrate(ctx, pool)
+//	_, err := pgq.Migrate(ctx, dsn, 30*time.Second)
 //
 // The module does NOT auto-migrate on New().
 package pgq
@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"time"
+	"unicode/utf8"
 
 	"github.com/rustwizard/cleargo/jobq"
 )
@@ -66,6 +67,10 @@ type Postgres struct {
 // New creates a Postgres queue. It does NOT verify that the table exists;
 // call Migrate or ensure your migration has run before first use.
 func New(db DB, cfg Config) (*Postgres, error) {
+	if db == nil {
+		return nil, errors.New("pgq: db must not be nil")
+	}
+
 	cfg = cfg.withDefaults()
 
 	if err := validateTableName(cfg.Table); err != nil {
@@ -198,9 +203,10 @@ func (p *Postgres) Ack(ctx context.Context, id int64) error {
 // to the terminal "failed" state.
 //
 // The error message is truncated to 2000 characters to keep the table tidy.
+// Truncation is rune-safe so multibyte (e.g. Cyrillic) text is never cut mid-rune.
 func (p *Postgres) Fail(ctx context.Context, id int64, errMsg string) error {
-	if len(errMsg) > 2000 {
-		errMsg = errMsg[:2000]
+	if utf8.RuneCountInString(errMsg) > 2000 {
+		errMsg = string([]rune(errMsg)[:2000])
 	}
 
 	res, err := p.db.ExecContext(ctx, `
@@ -266,7 +272,8 @@ func validateTableName(name string) error {
 	if name == "" {
 		return errors.New("table name must not be empty")
 	}
-	if len(name) > 63 {
+	// PostgreSQL limits identifiers to 63 *characters*, not bytes.
+	if utf8.RuneCountInString(name) > 63 {
 		return fmt.Errorf("table name %q exceeds 63 characters", name)
 	}
 	for i, c := range name {

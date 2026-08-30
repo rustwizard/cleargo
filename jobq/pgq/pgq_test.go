@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -38,8 +39,13 @@ func TestMain(m *testing.M) {
 	// Parse flags first; testing.Short() panics otherwise.
 	flag.Parse()
 
-	// Start a shared container unless running in short mode.
-	if !testing.Short() {
+	// Allow running integration tests against an external Postgres
+	// (e.g. in CI) without Docker: PGQ_TEST_DSN=postgres://user:pass@host:5432/db
+	if dsn := os.Getenv("PGQ_TEST_DSN"); dsn != "" {
+		sharedDSN = dsn
+		fmt.Fprintf(os.Stderr, "pgq: using external postgres from PGQ_TEST_DSN\n")
+	} else if !testing.Short() {
+		// Start a shared container unless running in short mode.
 		dsn, cleanup, err := startSharedPostgres(context.Background())
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "pgq: shared postgres unavailable (%v); integration tests will be skipped\n", err)
@@ -399,15 +405,27 @@ func TestFail_RetryThenTerminal(t *testing.T) {
 func TestFail_Truncation(t *testing.T) {
 	q, db := newQueue(t, Config{MaxAttempts: 1})
 	ctx := context.Background()
+
+	// ASCII payload: truncated to exactly 2000 chars.
 	_, _ = q.Enqueue(ctx, "long-err", nil)
 	job, err := q.Claim(ctx)
 	require.NoError(t, err)
-	long := strings.Repeat("x", 3000)
-	require.NoError(t, q.Fail(ctx, job.ID, long))
+	require.NoError(t, q.Fail(ctx, job.ID, strings.Repeat("x", 3000)))
 	var stored string
 	err = db.QueryRowContext(ctx, fmt.Sprintf("SELECT error FROM %s WHERE id=$1", q.table), job.ID).Scan(&stored)
 	require.NoError(t, err)
 	require.Len(t, stored, 2000)
+
+	// Cyrillic payload: truncation must not cut a multibyte rune in half.
+	_, _ = q.Enqueue(ctx, "long-err-cyr", nil)
+	job, err = q.Claim(ctx)
+	require.NoError(t, err)
+	cyr := strings.Repeat("й", 3000) // 2 bytes per rune
+	require.NoError(t, q.Fail(ctx, job.ID, cyr))
+	err = db.QueryRowContext(ctx, fmt.Sprintf("SELECT error FROM %s WHERE id=$1", q.table), job.ID).Scan(&stored)
+	require.NoError(t, err)
+	require.Equal(t, 2000, utf8.RuneCountInString(stored), "exactly 2000 runes, no broken UTF-8")
+	require.True(t, utf8.ValidString(stored), "stored error must be valid UTF-8")
 }
 
 func TestAck_NotProcessing(t *testing.T) {

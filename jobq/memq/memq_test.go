@@ -21,19 +21,27 @@ func TestConcurrent_EnqueueSameKey(t *testing.T) {
 
 	var wg sync.WaitGroup
 	successes := make(chan bool, workers)
+	errs := make(chan error, workers)
 
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			ok, err := m.Enqueue(ctx, "contested-key", map[string]any{"i": i})
-			require.NoError(t, err)
+			if err != nil {
+				errs <- err
+				return
+			}
 			successes <- ok
 		}()
 	}
 
 	wg.Wait()
 	close(successes)
+	close(errs)
+	for err := range errs {
+		t.Errorf("enqueue error: %v", err)
+	}
 
 	var count int
 	for ok := range successes {
@@ -65,6 +73,7 @@ func TestConcurrent_ClaimNoDouble(t *testing.T) {
 
 	// Each worker claims in a loop until the queue is empty.
 	claimed := make(chan int64, jobs)
+	errs := make(chan error, workers)
 	var wg sync.WaitGroup
 
 	for w := 0; w < workers; w++ {
@@ -77,7 +86,7 @@ func TestConcurrent_ClaimNoDouble(t *testing.T) {
 					if err == jobq.ErrNoJobs {
 						return
 					}
-					t.Errorf("unexpected error: %v", err)
+					errs <- err
 					return
 				}
 				claimed <- job.ID
@@ -87,6 +96,10 @@ func TestConcurrent_ClaimNoDouble(t *testing.T) {
 
 	wg.Wait()
 	close(claimed)
+	close(errs)
+	for err := range errs {
+		t.Errorf("claim error: %v", err)
+	}
 
 	// Collect and verify.
 	seen := make(map[int64]int)
@@ -151,7 +164,8 @@ func TestConcurrent_MixedOps(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 10; i++ {
-			m.ReclaimStale(ctx, 0) // noop, but exercises the lock
+			// timeout=0 uses the queue's staleAfter; jobs are fresh, so nothing is reclaimed.
+			m.ReclaimStale(ctx, 0)
 		}
 	}()
 

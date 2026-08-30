@@ -23,7 +23,7 @@ type Job struct {
 	Payload    map[string]any // произвольные данные (project_id, ref, commit_sha...)
 	Status     Status
 	Attempts   int
-	Error      string
+	Error      string // текст последней ошибки; заполняется при Fail, не возвращается из Claim
 	CreatedAt  time.Time
 	StartedAt  *time.Time
 	FinishedAt *time.Time
@@ -49,11 +49,10 @@ type Queue interface {
 
 	// ReclaimStale возвращает в pending задачи, зависшие в processing
 	// дольше timeout (воркер упал / OOM / kill). Возвращает число затронутых строк.
+	// timeout <= 0 означает «использовать дефолтный порог реализации»
+	// (pgq — StaleAfter из Config; memq — 5 минут).
 	ReclaimStale(ctx context.Context, timeout time.Duration) (int64, error)
 }
 
 // Публичные ошибки.
-var (
-	ErrNoJobs      = errors.New("jobq: no jobs available")
-	ErrMaxAttempts = errors.New("jobq: max attempts exceeded")
-)
+var ErrNoJobs = errors.New("jobq: no jobs available")
