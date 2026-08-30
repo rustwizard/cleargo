@@ -422,3 +422,32 @@ func TestGetByKey(t *testing.T) {
 	require.Equal(t, map[string]any{"a": 1}, j.Payload)
 	require.Nil(t, m.GetByKey("missing"))
 }
+
+// TestAck_StaleWorkerRejectedAfterReclaim mirrors the pgq test: after the
+// lease expires, a reclaim + re-claim hands the job to another worker, and
+// the stale worker's ack must be rejected.
+func TestAck_StaleWorkerRejectedAfterReclaim(t *testing.T) {
+	t.Skip("KNOWN BUG: Ack/Fail do not verify lease ownership; see pgq.TestAck_StaleWorkerRejectedAfterReclaim.")
+	m := New(3, 50*time.Millisecond)
+	m.SetLease(50 * time.Millisecond)
+	ctx := context.Background()
+
+	_, _ = m.Enqueue(ctx, "j", nil)
+	jobA, err := m.Claim(ctx)
+	require.NoError(t, err)
+
+	time.Sleep(120 * time.Millisecond)
+	n, err := m.ReclaimStale(ctx, 0)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, n)
+
+	jobB, err := m.Claim(ctx)
+	require.NoError(t, err)
+	require.Equal(t, jobA.ID, jobB.ID)
+
+	err = m.Ack(ctx, jobA.ID)
+	require.ErrorIs(t, err, ErrNotProcessing, "stale worker must not ack a re-claimed job")
+
+	require.NoError(t, m.Ack(ctx, jobB.ID))
+	require.Equal(t, jobq.Done, m.Get(jobA.ID).Status)
+}

@@ -1029,3 +1029,34 @@ func TestNew_MetricsRegistrationConflict(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "register collector")
 }
+
+// TestAck_StaleWorkerRejectedAfterReclaim proves that a worker whose lease
+// expired (job was reclaimed and re-claimed by another worker) must NOT be
+// able to ack the job anymore. The current implementation only checks
+// status='processing', so the stale ack silently succeeds — a bug.
+func TestAck_StaleWorkerRejectedAfterReclaim(t *testing.T) {
+	t.Skip("KNOWN BUG: Ack/Fail do not verify lease ownership; a worker whose job was reclaimed and re-claimed can still ack/fail another worker's attempt. Needs claim ownership (token or attempts) in the API.")
+	q, db := newQueue(t, Config{StaleAfter: 100 * time.Millisecond, Lease: 100 * time.Millisecond})
+	ctx := context.Background()
+
+	_, _ = q.Enqueue(ctx, "j", nil)
+	jobA, err := q.Claim(ctx) // worker A takes the job
+	require.NoError(t, err)
+
+	// A's lease expires; the job is reclaimed and taken by worker B.
+	time.Sleep(200 * time.Millisecond)
+	n, err := q.ReclaimStale(ctx, 0)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, n)
+	jobB, err := q.Claim(ctx)
+	require.NoError(t, err)
+	require.Equal(t, jobA.ID, jobB.ID)
+
+	// Worker A (stale) tries to ack the job it no longer owns.
+	err = q.Ack(ctx, jobA.ID)
+	require.ErrorIs(t, err, ErrNotProcessing, "stale worker must not ack a re-claimed job")
+
+	// And B's own work must still be ackable.
+	require.NoError(t, q.Ack(ctx, jobB.ID))
+	require.Equal(t, jobq.Done, rowStatus(t, db, q.table, jobA.ID))
+}
