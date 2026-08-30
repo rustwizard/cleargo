@@ -55,33 +55,61 @@ func startSharedPostgres(ctx context.Context) (string, func(), error) {
 		postgres.BasicWaitStrategies(),
 	)
 	if err != nil {
-		return "", func() {}, fmt.Errorf("container start: %w", err)
+		return "", func() {}, fmt.Errorf("start postgres container: %w", err)
 	}
+
+	var once sync.Once
+	cleanup := func() {
+		once.Do(func() {
+			// Use Background here so cleanup does not depend on a canceled test context.
+			if err := container.Terminate(context.Background()); err != nil {
+				fmt.Fprintf(os.Stderr, "pgq: warning: terminate postgres container: %v\n", err)
+			}
+		})
+	}
+
 	connStr, err := container.ConnectionString(ctx, "sslmode=disable")
 	if err != nil {
-		_ = container.Terminate(ctx)
-		return "", func() {}, fmt.Errorf("connection string: %w", err)
+		cleanup()
+		return "", func() {}, fmt.Errorf("build connection string: %w", err)
 	}
-	// Wait for the DB to accept connections.
-	var conn *pgx.Conn
-	for i := 0; i < 60; i++ {
-		conn, err = pgx.Connect(ctx, connStr)
-		if err == nil {
-			break
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
-	if err != nil {
-		_ = container.Terminate(ctx)
+
+	if err := waitForPostgres(ctx, connStr); err != nil {
+		cleanup()
 		return "", func() {}, fmt.Errorf("postgres not ready: %w", err)
 	}
-	_ = conn.Close(ctx)
-	cleanup := func() {
-		if err := container.Terminate(context.Background()); err != nil {
-			fmt.Fprintf(os.Stderr, "pgq: warning: container termination failed: %v\n", err)
+
+	return connStr, cleanup, nil
+}
+
+func waitForPostgres(ctx context.Context, connStr string) error {
+	// Respect the caller's context, but also bound the wait to 30s.
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	var lastErr error
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		conn, err := pgx.Connect(ctx, connStr)
+		if err == nil {
+			_ = conn.Close(ctx)
+			return nil
+		}
+
+		lastErr = err
+
+		select {
+		case <-ctx.Done():
+			// Return both the context error and the last connection error if useful.
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) && !errors.Is(lastErr, context.DeadlineExceeded) {
+				return errors.Join(lastErr, ctx.Err())
+			}
+			return ctx.Err()
+		case <-ticker.C:
 		}
 	}
-	return connStr, cleanup, nil
 }
 
 // requireShared returns the shared DSN or skips the test.
