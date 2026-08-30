@@ -29,6 +29,14 @@ type Job struct {
 	FinishedAt *time.Time
 }
 
+// Stats — снимок количества задач по каждому статусу на момент запроса.
+type Stats struct {
+	Pending    int
+	Processing int
+	Done       int
+	Failed     int
+}
+
 // Queue — контракт. Реализации: postgres, mem (тесты), redis (если вырастешь).
 type Queue interface {
 	// Enqueue добавляет задачу. Идемпотентно: если Key уже существует — не дублирует.
@@ -52,6 +60,13 @@ type Queue interface {
 	// timeout <= 0 означает «использовать дефолтный порог реализации»
 	// (pgq — StaleAfter из Config; memq — 5 минут).
 	ReclaimStale(ctx context.Context, timeout time.Duration) (int64, error)
+
+	// Stats возвращает количество задач по каждому статусу на момент запроса.
+	Stats(ctx context.Context) (Stats, error)
+
+	// Depth возвращает количество задач, которые Claim может выдать прямо сейчас
+	// (pending и не исчерпавшие попытки). Это подмножество Stats.Pending.
+	Depth(ctx context.Context) (int, error)
 }
 
 // Публичные ошибки.

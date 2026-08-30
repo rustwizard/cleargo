@@ -234,3 +234,55 @@ func TestConcurrent_EnqueueAndClaim(t *testing.T) {
 	// workers returned). Total count must be preserved.
 	require.Equal(t, total, m.Len())
 }
+
+func TestStats(t *testing.T) {
+	m := New(2)
+	ctx := context.Background()
+
+	// Empty queue.
+	st, err := m.Stats(ctx)
+	require.NoError(t, err)
+	require.Equal(t, jobq.Stats{}, st)
+	depth, err := m.Depth(ctx)
+	require.NoError(t, err)
+	require.Zero(t, depth)
+
+	for _, k := range []string{"s1", "s2", "s3"} {
+		ok, err := m.Enqueue(ctx, k, nil)
+		require.NoError(t, err)
+		require.True(t, ok)
+	}
+	st, err = m.Stats(ctx)
+	require.NoError(t, err)
+	require.Equal(t, jobq.Stats{Pending: 3}, st)
+	depth, err = m.Depth(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 3, depth)
+
+	job, err := m.Claim(ctx)
+	require.NoError(t, err)
+	st, err = m.Stats(ctx)
+	require.NoError(t, err)
+	require.Equal(t, jobq.Stats{Pending: 2, Processing: 1}, st)
+	depth, err = m.Depth(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 2, depth)
+
+	require.NoError(t, m.Ack(ctx, job.ID))
+	st, err = m.Stats(ctx)
+	require.NoError(t, err)
+	require.Equal(t, jobq.Stats{Pending: 2, Done: 1}, st)
+
+	// Exhaust attempts of s2 (maxAttempts=2).
+	for i := 0; i < 2; i++ {
+		job, err = m.Claim(ctx)
+		require.NoError(t, err)
+		require.NoError(t, m.Fail(ctx, job.ID, "boom"))
+	}
+	st, err = m.Stats(ctx)
+	require.NoError(t, err)
+	require.Equal(t, jobq.Stats{Pending: 1, Done: 1, Failed: 1}, st)
+	depth, err = m.Depth(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 1, depth)
+}

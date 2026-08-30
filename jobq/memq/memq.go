@@ -217,6 +217,42 @@ func (m *Mem) ReclaimStale(_ context.Context, timeout time.Duration) (int64, err
 	return count, nil
 }
 
+// Stats returns the number of jobs per status.
+func (m *Mem) Stats(_ context.Context) (jobq.Stats, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var s jobq.Stats
+	for _, j := range m.jobs {
+		switch j.Status {
+		case jobq.Pending:
+			s.Pending++
+		case jobq.Processing:
+			s.Processing++
+		case jobq.Done:
+			s.Done++
+		case jobq.Failed:
+			s.Failed++
+		}
+	}
+	return s, nil
+}
+
+// Depth returns the number of jobs Claim can hand out right now
+// (pending and not yet exhausted their attempts), matching Claim's logic.
+func (m *Mem) Depth(_ context.Context) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var n int
+	for _, j := range m.jobs {
+		if j.Status == jobq.Pending && j.Attempts < m.maxAttempts {
+			n++
+		}
+	}
+	return n, nil
+}
+
 // ---------------------------------------------------------------------------
 // Test helpers (not part of jobq.Queue)
 // ---------------------------------------------------------------------------
