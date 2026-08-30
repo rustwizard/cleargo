@@ -249,38 +249,43 @@ func TestConfig_WithDefaults(t *testing.T) {
 		wantStale time.Duration
 		wantBase  time.Duration
 		wantCap   time.Duration
+		wantLease time.Duration
 	}{{
 		name:      "zero",
 		in:        Config{},
-		wantTable: "jobq_jobs", wantMax: 3, wantStale: 5 * time.Minute, wantBase: 0, wantCap: 0,
+		wantTable: "jobq_jobs", wantMax: 3, wantStale: 5 * time.Minute, wantBase: 0, wantCap: 0, wantLease: 5 * time.Minute,
 	}, {
 		name:      "custom table",
 		in:        Config{Table: "my_jobs"},
-		wantTable: "my_jobs", wantMax: 3, wantStale: 5 * time.Minute, wantBase: 0, wantCap: 0,
+		wantTable: "my_jobs", wantMax: 3, wantStale: 5 * time.Minute, wantBase: 0, wantCap: 0, wantLease: 5 * time.Minute,
 	}, {
 		name:      "custom max",
 		in:        Config{MaxAttempts: 7},
-		wantTable: "jobq_jobs", wantMax: 7, wantStale: 5 * time.Minute, wantBase: 0, wantCap: 0,
+		wantTable: "jobq_jobs", wantMax: 7, wantStale: 5 * time.Minute, wantBase: 0, wantCap: 0, wantLease: 5 * time.Minute,
 	}, {
 		name:      "custom stale",
 		in:        Config{StaleAfter: time.Second},
-		wantTable: "jobq_jobs", wantMax: 3, wantStale: time.Second, wantBase: 0, wantCap: 0,
+		wantTable: "jobq_jobs", wantMax: 3, wantStale: time.Second, wantBase: 0, wantCap: 0, wantLease: time.Second,
 	}, {
 		name:      "neg max -> default",
 		in:        Config{MaxAttempts: -1},
-		wantTable: "jobq_jobs", wantMax: 3, wantStale: 5 * time.Minute, wantBase: 0, wantCap: 0,
+		wantTable: "jobq_jobs", wantMax: 3, wantStale: 5 * time.Minute, wantBase: 0, wantCap: 0, wantLease: 5 * time.Minute,
 	}, {
 		name:      "neg stale -> default",
 		in:        Config{StaleAfter: -time.Second},
-		wantTable: "jobq_jobs", wantMax: 3, wantStale: 5 * time.Minute, wantBase: 0, wantCap: 0,
+		wantTable: "jobq_jobs", wantMax: 3, wantStale: 5 * time.Minute, wantBase: 0, wantCap: 0, wantLease: 5 * time.Minute,
 	}, {
 		name:      "custom backoff",
 		in:        Config{RetryBase: 250 * time.Millisecond, RetryCap: 2 * time.Second},
-		wantTable: "jobq_jobs", wantMax: 3, wantStale: 5 * time.Minute, wantBase: 250 * time.Millisecond, wantCap: 2 * time.Second,
+		wantTable: "jobq_jobs", wantMax: 3, wantStale: 5 * time.Minute, wantBase: 250 * time.Millisecond, wantCap: 2 * time.Second, wantLease: 5 * time.Minute,
 	}, {
 		name:      "neg backoff -> default",
 		in:        Config{RetryBase: -time.Second, RetryCap: -time.Second},
-		wantTable: "jobq_jobs", wantMax: 3, wantStale: 5 * time.Minute, wantBase: 0, wantCap: 0,
+		wantTable: "jobq_jobs", wantMax: 3, wantStale: 5 * time.Minute, wantBase: 0, wantCap: 0, wantLease: 5 * time.Minute,
+	}, {
+		name:      "custom lease",
+		in:        Config{StaleAfter: time.Minute, Lease: 2 * time.Second},
+		wantTable: "jobq_jobs", wantMax: 3, wantStale: time.Minute, wantBase: 0, wantCap: 0, wantLease: 2 * time.Second,
 	}}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -290,6 +295,7 @@ func TestConfig_WithDefaults(t *testing.T) {
 			require.Equal(t, tc.wantStale, got.StaleAfter)
 			require.Equal(t, tc.wantBase, got.RetryBase)
 			require.Equal(t, tc.wantCap, got.RetryCap)
+			require.Equal(t, tc.wantLease, got.Lease)
 		})
 	}
 }
@@ -332,9 +338,9 @@ func TestMigration_Schema(t *testing.T) {
 
 	var n int
 	// Verify expected columns exist in the core table.
-	q := `SELECT count(*) FROM information_schema.columns WHERE table_name='jobq_jobs' AND column_name IN ('id','key','payload','status','attempts','max_attempts','error','created_at','started_at','finished_at','run_after')`
+	q := `SELECT count(*) FROM information_schema.columns WHERE table_name='jobq_jobs' AND column_name IN ('id','key','payload','status','attempts','max_attempts','error','created_at','started_at','finished_at','run_after','lease_until')`
 	require.NoError(t, db.QueryRowContext(ctx, q).Scan(&n))
-	require.Equal(t, 11, n)
+	require.Equal(t, 12, n)
 	// Verify constraint and index.
 	err = db.QueryRowContext(ctx, `SELECT count(*) FROM pg_constraint WHERE conname='jobq_jobs_status_chk'`).Scan(&n)
 	require.NoError(t, err)
@@ -566,8 +572,10 @@ func TestReclaimStale(t *testing.T) {
 	freshJob, err := q.Claim(ctx)
 	require.NoError(t, err)
 
-	// Age the stale job.
-	_, err = db.ExecContext(ctx, fmt.Sprintf("UPDATE %s SET started_at = now() - interval '10 minutes' WHERE id=$1", q.table), staleJob.ID)
+	// Age the stale job: both started_at and the lease must be in the past,
+	// otherwise the fresh lease (now + Lease) would keep it un-reclaimable.
+	_, err = db.ExecContext(ctx, fmt.Sprintf(
+		"UPDATE %s SET started_at = now() - interval '10 minutes', lease_until = now() - interval '10 minutes' WHERE id=$1", q.table), staleJob.ID)
 	require.NoError(t, err)
 
 	reclaimed, err := q.ReclaimStale(ctx, 5*time.Minute)
@@ -842,4 +850,213 @@ func TestMetrics(t *testing.T) {
 	mfs, err = reg.Gather()
 	require.NoError(t, err)
 	require.Equal(t, 1.0, gaugeValue(mfs, "jobq_jobs_by_status", q.table, "pending"))
+}
+
+func TestHeartbeat_PreventsReclaim(t *testing.T) {
+	q, db := newQueue(t, Config{StaleAfter: 150 * time.Millisecond, Lease: 300 * time.Millisecond})
+	ctx := context.Background()
+
+	ok, err := q.Enqueue(ctx, "long", nil)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	job, err := q.Claim(ctx)
+	require.NoError(t, err)
+
+	// StaleAfter has passed, but the lease is still active: not reclaimed.
+	time.Sleep(200 * time.Millisecond)
+	n, err := q.ReclaimStale(ctx, 150*time.Millisecond)
+	require.NoError(t, err)
+	require.EqualValues(t, 0, n)
+	require.Equal(t, jobq.Processing, rowStatus(t, db, q.table, job.ID))
+
+	// Heartbeat renews the lease: still not reclaimed after another StaleAfter.
+	require.NoError(t, q.Heartbeat(ctx, job.ID))
+	time.Sleep(200 * time.Millisecond)
+	n, err = q.ReclaimStale(ctx, 150*time.Millisecond)
+	require.NoError(t, err)
+	require.EqualValues(t, 0, n)
+
+	// Without a heartbeat the lease expires and the job is reclaimed.
+	time.Sleep(400 * time.Millisecond)
+	n, err = q.ReclaimStale(ctx, 150*time.Millisecond)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, n)
+	require.Equal(t, jobq.Pending, rowStatus(t, db, q.table, job.ID))
+}
+
+func TestHeartbeat_NotProcessing(t *testing.T) {
+	q, db := newQueue(t, Config{Lease: 100 * time.Millisecond})
+	ctx := context.Background()
+
+	ok, err := q.Enqueue(ctx, "h", nil)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	var id int64
+	require.NoError(t, db.QueryRowContext(ctx, fmt.Sprintf("SELECT id FROM %s WHERE key='h'", q.table)).Scan(&id))
+
+	// Pending job: heartbeat fails.
+	err = q.Heartbeat(ctx, id)
+	require.ErrorIs(t, err, ErrNotProcessing)
+
+	// After claim the heartbeat works.
+	job, err := q.Claim(ctx)
+	require.NoError(t, err)
+	require.NoError(t, q.Heartbeat(ctx, job.ID))
+
+	// After the lease expires, heartbeat fails (job still processing).
+	time.Sleep(200 * time.Millisecond)
+	err = q.Heartbeat(ctx, job.ID)
+	require.ErrorIs(t, err, ErrNotProcessing)
+
+	// Done job: heartbeat fails.
+	require.NoError(t, q.Ack(ctx, job.ID))
+	err = q.Heartbeat(ctx, job.ID)
+	require.ErrorIs(t, err, ErrNotProcessing)
+
+	// Unknown id: heartbeat fails.
+	err = q.Heartbeat(ctx, 999999)
+	require.ErrorIs(t, err, ErrNotProcessing)
+}
+
+func TestClaim_SetsLease(t *testing.T) {
+	q, db := newQueue(t, Config{Lease: time.Minute})
+	ctx := context.Background()
+
+	ok, err := q.Enqueue(ctx, "leased", nil)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	job, err := q.Claim(ctx)
+	require.NoError(t, err)
+
+	var active bool
+	err = db.QueryRowContext(ctx, fmt.Sprintf("SELECT lease_until > now() FROM %s WHERE id=$1", q.table), job.ID).Scan(&active)
+	require.NoError(t, err)
+	require.True(t, active, "claimed job must hold a future lease")
+}
+
+func TestHeartbeat_RenewsLease(t *testing.T) {
+	q, db := newQueue(t, Config{Lease: 5 * time.Minute})
+	ctx := context.Background()
+
+	_, _ = q.Enqueue(ctx, "hb", nil)
+	job, err := q.Claim(ctx)
+	require.NoError(t, err)
+
+	var before float64
+	err = db.QueryRowContext(ctx, fmt.Sprintf("SELECT extract(epoch from lease_until) FROM %s WHERE id=$1", q.table), job.ID).Scan(&before)
+	require.NoError(t, err)
+
+	time.Sleep(30 * time.Millisecond)
+	require.NoError(t, q.Heartbeat(ctx, job.ID))
+
+	var after float64
+	err = db.QueryRowContext(ctx, fmt.Sprintf("SELECT extract(epoch from lease_until) FROM %s WHERE id=$1", q.table), job.ID).Scan(&after)
+	require.NoError(t, err)
+	require.Greater(t, after, before, "heartbeat must push lease_until forward")
+}
+
+func TestStaleAfter(t *testing.T) {
+	q, err := New(noopDB{}, Config{StaleAfter: 42 * time.Second})
+	require.NoError(t, err)
+	require.Equal(t, 42*time.Second, q.StaleAfter())
+
+	q, err = New(noopDB{}, Config{})
+	require.NoError(t, err)
+	require.Equal(t, 5*time.Minute, q.StaleAfter())
+}
+
+func TestEnqueue_MarshalError(t *testing.T) {
+	q, err := New(noopDB{}, Config{})
+	require.NoError(t, err)
+	_, err = q.Enqueue(context.Background(), "bad", map[string]any{"ch": make(chan int)})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "marshal payload")
+}
+
+func TestCanceledContext(t *testing.T) {
+	q, _ := newQueue(t, Config{})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already canceled
+
+	_, err := q.Enqueue(ctx, "x", nil)
+	require.Error(t, err)
+	_, err = q.Claim(ctx)
+	require.Error(t, err)
+	err = q.Ack(ctx, 1)
+	require.Error(t, err)
+	err = q.Fail(ctx, 1, "x")
+	require.Error(t, err)
+	err = q.Heartbeat(ctx, 1)
+	require.Error(t, err)
+	_, err = q.ReclaimStale(ctx, time.Second)
+	require.Error(t, err)
+	_, err = q.Stats(ctx)
+	require.Error(t, err)
+	_, err = q.Depth(ctx)
+	require.Error(t, err)
+}
+
+func TestMetrics_SharedRegistry(t *testing.T) {
+	reg := prometheus.NewRegistry()
+
+	q1, _ := newQueue(t, Config{Metrics: reg})
+	_, _ = q1.Enqueue(context.Background(), "a", nil)
+
+	// A second queue on the same registry must not conflict (label table
+	// keeps the series apart) and must be added to the shared collector.
+	q2, _ := newQueue(t, Config{Metrics: reg})
+	_, _ = q2.Enqueue(context.Background(), "b", nil)
+
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+	require.Equal(t, 1.0, gaugeValue(mfs, "jobq_jobs_by_status", q1.table, "pending"))
+	require.Equal(t, 1.0, gaugeValue(mfs, "jobq_jobs_by_status", q2.table, "pending"))
+}
+
+func TestNew_MetricsRegistrationConflict(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	// Pre-register a metric with the same name to force AlreadyRegistered.
+	conflict := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "jobq", Name: "ops_total", Help: "conflict",
+	}, []string{"table", "op"})
+	require.NoError(t, reg.Register(conflict))
+
+	q, _ := newQueue(t, Config{})
+	_, err := New(q.db, Config{Table: q.table, Metrics: reg})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "register collector")
+}
+
+// TestAck_StaleWorkerRejectedAfterReclaim proves that a worker whose lease
+// expired (job was reclaimed and re-claimed by another worker) must NOT be
+// able to ack the job anymore. The current implementation only checks
+// status='processing', so the stale ack silently succeeds — a bug.
+func TestAck_StaleWorkerRejectedAfterReclaim(t *testing.T) {
+	t.Skip("KNOWN BUG: Ack/Fail do not verify lease ownership; a worker whose job was reclaimed and re-claimed can still ack/fail another worker's attempt. Needs claim ownership (token or attempts) in the API.")
+	q, db := newQueue(t, Config{StaleAfter: 100 * time.Millisecond, Lease: 100 * time.Millisecond})
+	ctx := context.Background()
+
+	_, _ = q.Enqueue(ctx, "j", nil)
+	jobA, err := q.Claim(ctx) // worker A takes the job
+	require.NoError(t, err)
+
+	// A's lease expires; the job is reclaimed and taken by worker B.
+	time.Sleep(200 * time.Millisecond)
+	n, err := q.ReclaimStale(ctx, 0)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, n)
+	jobB, err := q.Claim(ctx)
+	require.NoError(t, err)
+	require.Equal(t, jobA.ID, jobB.ID)
+
+	// Worker A (stale) tries to ack the job it no longer owns.
+	err = q.Ack(ctx, jobA.ID)
+	require.ErrorIs(t, err, ErrNotProcessing, "stale worker must not ack a re-claimed job")
+
+	// And B's own work must still be ackable.
+	require.NoError(t, q.Ack(ctx, jobB.ID))
+	require.Equal(t, jobq.Done, rowStatus(t, db, q.table, jobA.ID))
 }

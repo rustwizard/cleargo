@@ -325,3 +325,129 @@ func TestBackoff(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 2, j2.Attempts)
 }
+
+func TestHeartbeat(t *testing.T) {
+	m := New(3, 50*time.Millisecond) // staleAfter
+	m.SetLease(200 * time.Millisecond)
+	ctx := context.Background()
+
+	ok, err := m.Enqueue(ctx, "long", nil)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	job, err := m.Claim(ctx)
+	require.NoError(t, err)
+
+	// Lease active past staleAfter: not reclaimed.
+	time.Sleep(100 * time.Millisecond)
+	n, err := m.ReclaimStale(ctx, 0)
+	require.NoError(t, err)
+	require.EqualValues(t, 0, n)
+
+	// Heartbeat renews; still not reclaimed.
+	require.NoError(t, m.Heartbeat(ctx, job.ID))
+	time.Sleep(100 * time.Millisecond)
+	n, err = m.ReclaimStale(ctx, 0)
+	require.NoError(t, err)
+	require.EqualValues(t, 0, n)
+
+	// Lease expires without heartbeat: reclaimed back to pending.
+	time.Sleep(200 * time.Millisecond)
+	n, err = m.ReclaimStale(ctx, 0)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, n)
+	require.Equal(t, jobq.Pending, m.Get(job.ID).Status)
+
+	// Heartbeat on a non-processing job fails.
+	err = m.Heartbeat(ctx, job.ID)
+	require.ErrorIs(t, err, ErrNotProcessing)
+}
+
+// TestBackoff_Deterministic drives the backoff with an injected clock instead
+// of sleeping: advancing the clock past the delay makes the job claimable.
+func TestBackoff_Deterministic(t *testing.T) {
+	m := New(3)
+	now := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	m.SetClock(func() time.Time { return now })
+	m.SetRetryBase(100 * time.Millisecond)
+	ctx := context.Background()
+
+	_, _ = m.Enqueue(ctx, "bk", nil)
+	job, err := m.Claim(ctx)
+	require.NoError(t, err)
+	require.NoError(t, m.Fail(ctx, job.ID, "e1"))
+
+	// Deferred until now+100ms.
+	depth, _ := m.Depth(ctx)
+	require.Zero(t, depth)
+	_, err = m.Claim(ctx)
+	require.ErrorIs(t, err, jobq.ErrNoJobs)
+
+	// Advance halfway: still deferred.
+	now = now.Add(50 * time.Millisecond)
+	depth, _ = m.Depth(ctx)
+	require.Zero(t, depth)
+
+	// Advance past the delay: claimable again, attempt 2.
+	now = now.Add(100 * time.Millisecond)
+	job, err = m.Claim(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 2, job.Attempts)
+}
+
+func TestRetryCap(t *testing.T) {
+	m := New(3)
+	m.SetRetryBase(100 * time.Millisecond)
+	m.SetRetryCap(250 * time.Millisecond)
+
+	require.Equal(t, 100*time.Millisecond, m.backoffDelay(1))
+	require.Equal(t, 200*time.Millisecond, m.backoffDelay(2))
+	require.Equal(t, 250*time.Millisecond, m.backoffDelay(3)) // 400ms capped
+	require.Equal(t, 250*time.Millisecond, m.backoffDelay(10))
+}
+
+func TestMaxAttempts(t *testing.T) {
+	require.Equal(t, 3, New(0).MaxAttempts())
+	require.Equal(t, 7, New(7).MaxAttempts())
+}
+
+func TestGetByKey(t *testing.T) {
+	m := New(3)
+	_, err := m.Enqueue(context.Background(), "k1", map[string]any{"a": 1})
+	require.NoError(t, err)
+
+	j := m.GetByKey("k1")
+	require.NotNil(t, j)
+	require.Equal(t, "k1", j.Key)
+	require.Equal(t, map[string]any{"a": 1}, j.Payload)
+	require.Nil(t, m.GetByKey("missing"))
+}
+
+// TestAck_StaleWorkerRejectedAfterReclaim mirrors the pgq test: after the
+// lease expires, a reclaim + re-claim hands the job to another worker, and
+// the stale worker's ack must be rejected.
+func TestAck_StaleWorkerRejectedAfterReclaim(t *testing.T) {
+	t.Skip("KNOWN BUG: Ack/Fail do not verify lease ownership; see pgq.TestAck_StaleWorkerRejectedAfterReclaim.")
+	m := New(3, 50*time.Millisecond)
+	m.SetLease(50 * time.Millisecond)
+	ctx := context.Background()
+
+	_, _ = m.Enqueue(ctx, "j", nil)
+	jobA, err := m.Claim(ctx)
+	require.NoError(t, err)
+
+	time.Sleep(120 * time.Millisecond)
+	n, err := m.ReclaimStale(ctx, 0)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, n)
+
+	jobB, err := m.Claim(ctx)
+	require.NoError(t, err)
+	require.Equal(t, jobA.ID, jobB.ID)
+
+	err = m.Ack(ctx, jobA.ID)
+	require.ErrorIs(t, err, ErrNotProcessing, "stale worker must not ack a re-claimed job")
+
+	require.NoError(t, m.Ack(ctx, jobB.ID))
+	require.Equal(t, jobq.Done, m.Get(jobA.ID).Status)
+}

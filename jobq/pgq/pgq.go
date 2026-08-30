@@ -57,6 +57,12 @@ type Config struct {
 	// Default: 1 minute (only used when RetryBase > 0).
 	RetryCap time.Duration
 
+	// Lease is how long a claimed job's lease runs before ReclaimStale may
+	// consider it orphaned. Workers processing long jobs must call Heartbeat
+	// to renew the lease. Default: equal to StaleAfter (5 minutes), which
+	// keeps ReclaimStale's behavior identical for short jobs.
+	Lease time.Duration
+
 	// Metrics is a Prometheus registerer for queue metrics. When non-nil the
 	// queue registers a collector exposing:
 	//
@@ -86,6 +92,9 @@ func (c Config) withDefaults() Config {
 	if c.RetryBase > 0 && c.RetryCap <= 0 {
 		c.RetryCap = time.Minute
 	}
+	if c.Lease <= 0 {
+		c.Lease = c.StaleAfter
+	}
 	return c
 }
 
@@ -97,6 +106,7 @@ type Postgres struct {
 	staleAfter  time.Duration
 	retryBase   time.Duration // <= 0 disables backoff
 	retryCap    time.Duration
+	lease       time.Duration // renewable claim window, see Config.Lease
 	metrics     *queueMetrics // nil when metrics are disabled
 }
 
@@ -120,6 +130,7 @@ func New(db DB, cfg Config) (*Postgres, error) {
 		staleAfter:  cfg.StaleAfter,
 		retryBase:   cfg.RetryBase,
 		retryCap:    cfg.RetryCap,
+		lease:       cfg.Lease,
 	}
 
 	if cfg.Metrics != nil {
@@ -187,10 +198,11 @@ func (p *Postgres) Claim(ctx context.Context) (*jobq.Job, error) {
 
 	err := p.db.QueryRowContext(ctx, `
 		UPDATE `+p.table+`
-		SET status     = 'processing',
-		    started_at = now(),
-		    attempts   = attempts + 1,
-		    error      = NULL
+		SET status      = 'processing',
+		    started_at  = now(),
+		    attempts    = attempts + 1,
+		    error       = NULL,
+		    lease_until = now() + make_interval(secs => $1)
 		WHERE id = (
 			SELECT id FROM `+p.table+`
 			WHERE status = 'pending'
@@ -201,7 +213,7 @@ func (p *Postgres) Claim(ctx context.Context) (*jobq.Job, error) {
 			FOR UPDATE SKIP LOCKED
 		)
 		RETURNING id, key, payload, status, attempts, created_at, started_at
-	`).Scan(&id, &key, &payloadBytes, &status, &attempts, &createdAt, &startedAt)
+	`, p.lease.Seconds()).Scan(&id, &key, &payloadBytes, &status, &attempts, &createdAt, &startedAt)
 
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, jobq.ErrNoJobs
@@ -252,6 +264,30 @@ func (p *Postgres) Ack(ctx context.Context, id int64) error {
 	return nil
 }
 
+// Heartbeat renews the job's lease so ReclaimStale does not treat a live
+// worker as crashed. Call it periodically while processing long jobs; the
+// lease is a sliding window of Config.Lease from this call. Returns
+// ErrNotProcessing when the job is not "processing" or its lease already
+// expired.
+func (p *Postgres) Heartbeat(ctx context.Context, id int64) error {
+	res, err := p.db.ExecContext(ctx, `
+		UPDATE `+p.table+`
+		SET lease_until = now() + make_interval(secs => $2)
+		WHERE id = $1 AND status = 'processing'
+		  AND (lease_until IS NULL OR lease_until > now())
+	`, id, float64(p.lease.Seconds()))
+	if err != nil {
+		return fmt.Errorf("pgq: heartbeat job %d: %w", id, err)
+	}
+
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("pgq: heartbeat job %d: %w", id, ErrNotProcessing)
+	}
+	p.incOp("heartbeat")
+	return nil
+}
+
 // Fail records an error on a job. If the job has not yet exhausted its
 // max_attempts it is put back to pending for retry; otherwise it transitions
 // to the terminal "failed" state.
@@ -292,8 +328,11 @@ func (p *Postgres) Fail(ctx context.Context, id int64, errMsg string) error {
 	return nil
 }
 
-// ReclaimStale returns orphaned jobs (stuck in "processing" longer than the
-// given timeout) back to "pending" so another worker can pick them up.
+// ReclaimStale returns orphaned jobs back to "pending" so another worker can
+// pick them up. A job is considered orphaned when its claim lease has
+// expired (lease_until in the past); jobs without a lease — rows created
+// before the 000003_lease migration, or legacy paths — fall back to the
+// StartedAt-based timeout below.
 // This handles the case where a worker crashed, was OOM-killed, or lost
 // network connectivity mid-processing.
 //
@@ -308,12 +347,18 @@ func (p *Postgres) ReclaimStale(ctx context.Context, timeout time.Duration) (int
 
 	res, err := p.db.ExecContext(ctx, `
 		UPDATE `+p.table+`
-		SET status     = 'pending',
-		    started_at = NULL,
-		    error      = NULL,
-		    run_after  = now()
+		SET status      = 'pending',
+		    started_at  = NULL,
+		    error       = NULL,
+		    run_after   = now(),
+		    lease_until = NULL
 		WHERE status = 'processing'
-		  AND started_at < now() - make_interval(secs => $1)
+		  AND (
+		      -- claimed jobs with an expired lease are orphaned:
+		      (lease_until IS NOT NULL AND lease_until < now()) OR
+		      -- legacy rows without a lease fall back to the old behavior:
+		      (lease_until IS NULL AND started_at < now() - make_interval(secs => $1))
+		  )
 	`, float64(timeout.Seconds()))
 	if err != nil {
 		return 0, fmt.Errorf("pgq: reclaim stale: %w", err)
