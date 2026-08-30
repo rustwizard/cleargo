@@ -3,7 +3,9 @@ package pgq
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"os"
 	"strings"
@@ -26,7 +28,16 @@ var (
 	tableCounter  int64
 )
 
+// Time bounds for the shared container startup and readiness check.
+const (
+	postgresWaitTimeout   = 30 * time.Second
+	postgresRetryInterval = 500 * time.Millisecond
+)
+
 func TestMain(m *testing.M) {
+	// Parse flags first; testing.Short() panics otherwise.
+	flag.Parse()
+
 	// Start a shared container unless running in short mode.
 	if !testing.Short() {
 		dsn, cleanup, err := startSharedPostgres(context.Background())
@@ -83,12 +94,12 @@ func startSharedPostgres(ctx context.Context) (string, func(), error) {
 }
 
 func waitForPostgres(ctx context.Context, connStr string) error {
-	// Respect the caller's context, but also bound the wait to 30s.
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	// Respect the caller's context, but also bound the wait to a fixed timeout.
+	ctx, cancel := context.WithTimeout(ctx, postgresWaitTimeout)
 	defer cancel()
 
 	var lastErr error
-	ticker := time.NewTicker(500 * time.Millisecond)
+	ticker := time.NewTicker(postgresRetryInterval)
 	defer ticker.Stop()
 
 	for {
@@ -131,6 +142,12 @@ func newQueue(t *testing.T, cfg Config) (*Postgres, *sql.DB) {
 	db, err := sql.Open("pgx", dsn)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
+
+	// Bound the connection pool: Postgres default max_connections is 100,
+	// and an unbounded pool would blow past it under concurrent tests
+	// ("sorry, too many clients already").
+	db.SetMaxOpenConns(16)
+	db.SetMaxIdleConns(16)
 
 	if cfg.Table == "" {
 		n := atomic.AddInt64(&tableCounter, 1)
@@ -310,9 +327,14 @@ func TestEnqueue_Idempotent(t *testing.T) {
 	var cnt int
 	require.NoError(t, db.QueryRowContext(ctx, fmt.Sprintf("SELECT count(*) FROM %s", q.table)).Scan(&cnt))
 	require.Equal(t, 1, cnt)
+
+	// Original payload must be preserved (jsonb normalizes formatting,
+	// so compare semantically, not textually).
 	var payload []byte
 	require.NoError(t, db.QueryRowContext(ctx, fmt.Sprintf("SELECT payload FROM %s WHERE key='dup'", q.table)).Scan(&payload))
-	require.Contains(t, string(payload), `"v":1`)
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(payload, &got))
+	require.Equal(t, map[string]any{"v": float64(1)}, got)
 }
 
 func TestEnqueue_EmptyKey(t *testing.T) {
@@ -460,6 +482,7 @@ func TestConcurrent_ClaimNoDouble(t *testing.T) {
 		require.True(t, ok)
 	}
 	claimed := make(chan int64, jobs)
+	errCh := make(chan error, workers)
 	var wg sync.WaitGroup
 	for w := 0; w < workers; w++ {
 		wg.Add(1)
@@ -471,7 +494,7 @@ func TestConcurrent_ClaimNoDouble(t *testing.T) {
 					if errors.Is(err, jobq.ErrNoJobs) {
 						return
 					}
-					t.Errorf("claim error: %v", err)
+					errCh <- err
 					return
 				}
 				claimed <- job.ID
@@ -480,6 +503,10 @@ func TestConcurrent_ClaimNoDouble(t *testing.T) {
 	}
 	wg.Wait()
 	close(claimed)
+	close(errCh)
+	for err := range errCh {
+		t.Errorf("claim error: %v", err)
+	}
 	seen := make(map[int64]int)
 	total := 0
 	for id := range claimed {
@@ -528,6 +555,8 @@ func TestConcurrent_MixedOps(t *testing.T) {
 	)
 	q, db := newQueue(t, Config{MaxAttempts: 3})
 	ctx := context.Background()
+
+	errCh := make(chan error, enqueues+workers*100)
 	var wg sync.WaitGroup
 
 	// Enqueuers.
@@ -535,11 +564,13 @@ func TestConcurrent_MixedOps(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			q.Enqueue(ctx, fmt.Sprintf("m-%d", i), nil)
+			if _, err := q.Enqueue(ctx, fmt.Sprintf("m-%d", i), nil); err != nil {
+				errCh <- fmt.Errorf("enqueue m-%d: %w", i, err)
+			}
 		}(i)
 	}
 
-	// Workers.
+	// Workers: claim -> randomly ack or fail.
 	for w := 0; w < workers; w++ {
 		wg.Add(1)
 		go func(w int) {
@@ -550,15 +581,23 @@ func TestConcurrent_MixedOps(t *testing.T) {
 					return
 				}
 				if i%3 == 0 {
-					q.Fail(ctx, job.ID, fmt.Sprintf("w%d-%d", w, i))
+					if err := q.Fail(ctx, job.ID, fmt.Sprintf("w%d-%d", w, i)); err != nil {
+						errCh <- fmt.Errorf("fail job %d: %w", job.ID, err)
+					}
 				} else {
-					q.Ack(ctx, job.ID)
+					if err := q.Ack(ctx, job.ID); err != nil {
+						errCh <- fmt.Errorf("ack job %d: %w", job.ID, err)
+					}
 				}
 			}
 		}(w)
 	}
 
 	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Errorf("goroutine error: %v", err)
+	}
 
 	// Invariants.
 	var total int

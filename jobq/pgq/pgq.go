@@ -179,6 +179,7 @@ func (p *Postgres) Claim(ctx context.Context) (*jobq.Job, error) {
 func (p *Postgres) Ack(ctx context.Context, id int64) error {
 	res, err := p.db.ExecContext(ctx, `
 		UPDATE `+p.table+`
+		SET status = 'done', finished_at = now()
 		WHERE id = $1 AND status = 'processing'
 	`, id)
 	if err != nil {
