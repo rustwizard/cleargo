@@ -28,7 +28,11 @@ type Mem struct {
 	maxAttempts int
 	staleAfter  time.Duration
 	retryBase   time.Duration       // <= 0 disables backoff
+	retryCap    time.Duration       // <= 0 means no cap
 	retryAt     map[int64]time.Time // id → earliest claim time after a failed attempt
+	lease       time.Duration       // lease duration set at claim time (default 5m)
+	leaseUntil  map[int64]time.Time // id → lease expiry, while processing
+	nowFn       func() time.Time    // injectable clock, default time.Now
 }
 
 // New creates an in-memory queue. maxAttempts is stamped onto every job
@@ -53,8 +57,26 @@ func New(maxAttempts int, staleAfter ...time.Duration) *Mem {
 		maxAttempts: maxAttempts,
 		staleAfter:  sa,
 		retryAt:     make(map[int64]time.Time),
+		lease:       5 * time.Minute,
+		leaseUntil:  make(map[int64]time.Time),
+		nowFn:       time.Now,
 	}
 }
+
+// SetClock overrides the queue's time source (default time.Now), which makes
+// backoff/lease/reclaim behaviour deterministic in tests: advance the clock
+// instead of sleeping. Passing nil restores the real clock.
+func (m *Mem) SetClock(now func() time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if now == nil {
+		now = time.Now
+	}
+	m.nowFn = now
+}
+
+// now returns the current time (UTC) according to the injected clock.
+func (m *Mem) now() time.Time { return m.nowFn().UTC() }
 
 // MaxAttempts returns the configured retry limit (useful in test assertions).
 func (m *Mem) MaxAttempts() int { return m.maxAttempts }
@@ -66,6 +88,27 @@ func (m *Mem) SetRetryBase(d time.Duration) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.retryBase = d
+}
+
+// SetRetryCap caps the exponential backoff delay computed from RetryBase,
+// matching pgq.Config.RetryCap. A value <= 0 (default) leaves the delay
+// uncapped.
+func (m *Mem) SetRetryCap(d time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.retryCap = d
+}
+
+// SetLease sets how long a claimed job's lease runs (default 5 minutes),
+// matching pgq.Config.Lease semantics. Workers processing long jobs must
+// call Heartbeat to renew it; otherwise ReclaimStale reclaims the job once
+// the lease expires. A value <= 0 is ignored.
+func (m *Mem) SetLease(d time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if d > 0 {
+		m.lease = d
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -95,7 +138,7 @@ func (m *Mem) Enqueue(_ context.Context, key string, payload map[string]any) (bo
 		Payload:   payload,
 		Status:    jobq.Pending,
 		Attempts:  0,
-		CreatedAt: time.Now().UTC(),
+		CreatedAt: m.now(),
 	}
 	m.keys[key] = id
 
@@ -120,7 +163,7 @@ func (m *Mem) Claim(_ context.Context) (*jobq.Job, error) {
 		if j.Attempts >= m.maxAttempts {
 			continue
 		}
-		if ra, ok := m.retryAt[j.ID]; ok && ra.After(time.Now().UTC()) {
+		if ra, ok := m.retryAt[j.ID]; ok && ra.After(m.now()) {
 			continue // still in backoff
 		}
 		if target == nil || j.ID < target.ID {
@@ -132,11 +175,12 @@ func (m *Mem) Claim(_ context.Context) (*jobq.Job, error) {
 		return nil, jobq.ErrNoJobs
 	}
 
-	now := time.Now().UTC()
+	now := m.now()
 	target.Status = jobq.Processing
 	target.Attempts++
 	target.StartedAt = &now
 	delete(m.retryAt, target.ID)
+	m.leaseUntil[target.ID] = now.Add(m.lease) // claim grants a renewable lease
 
 	// Shallow copy: caller gets an independent struct, but Payload map is
 	// shared. Acceptable for a test helper.
@@ -158,10 +202,11 @@ func (m *Mem) Ack(_ context.Context, id int64) error {
 		return ErrNotProcessing
 	}
 
-	now := time.Now().UTC()
+	now := m.now()
 	j.Status = jobq.Done
 	j.FinishedAt = &now // see note below
 	delete(m.retryAt, id)
+	delete(m.leaseUntil, id) // done jobs keep no lease
 
 	return nil
 }
@@ -188,9 +233,10 @@ func (m *Mem) Fail(_ context.Context, id int64, errMsg string) error {
 
 	j.Error = errMsg
 	j.StartedAt = nil
+	delete(m.leaseUntil, id) // no longer processing: keep no lease
 
 	if j.Attempts >= m.maxAttempts {
-		now := time.Now().UTC()
+		now := m.now()
 		j.Status = jobq.Failed
 		j.FinishedAt = &now
 		delete(m.retryAt, id)
@@ -198,8 +244,7 @@ func (m *Mem) Fail(_ context.Context, id int64, errMsg string) error {
 		j.Status = jobq.Pending
 		j.FinishedAt = nil
 		if m.retryBase > 0 {
-			delay := m.retryBase * time.Duration(1<<uint(j.Attempts-1))
-			m.retryAt[id] = time.Now().UTC().Add(delay)
+			m.retryAt[id] = m.now().Add(m.backoffDelay(j.Attempts))
 		} else {
 			delete(m.retryAt, id)
 		}
@@ -208,10 +253,50 @@ func (m *Mem) Fail(_ context.Context, id int64, errMsg string) error {
 	return nil
 }
 
-// ReclaimStale returns processing jobs whose StartedAt is older than timeout
-// back to pending. Returns the number of reclaimed jobs.
-// A timeout <= 0 falls back to the queue's configured staleAfter (5 minutes
-// by default), matching pgq semantics.
+// backoffDelay returns RetryBase * 2^(attempts-1), capped at RetryCap
+// (when set), mirroring pgq's exponential backoff.
+func (m *Mem) backoffDelay(attempts int) time.Duration {
+	exp := attempts - 1
+	if exp > 30 { // avoid overflow; a cap (if any) clamps it anyway
+		exp = 30
+	}
+	delay := m.retryBase * time.Duration(1<<uint(exp))
+	if m.retryCap > 0 && delay > m.retryCap {
+		delay = m.retryCap
+	}
+	return delay
+}
+
+// Heartbeat renews the job's lease so ReclaimStale does not treat a live,
+// long-running worker as crashed. Returns ErrNotProcessing if the job is not
+// processing or its lease has already expired (in which case worker A must
+// win the race: re-running a job whose lease lapsed is intended).
+func (m *Mem) Heartbeat(_ context.Context, id int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	j, ok := m.jobs[id]
+	if !ok {
+		return errors.New("memq: heartbeat: job not found")
+	}
+	if j.Status != jobq.Processing {
+		return ErrNotProcessing
+	}
+
+	now := m.now()
+	if until, ok := m.leaseUntil[id]; ok && !until.After(now) {
+		return ErrNotProcessing // lease already expired → job may be reclaimed
+	}
+
+	m.leaseUntil[id] = now.Add(m.lease) // renewable: see pgq Heartbeat
+	return nil
+}
+
+// ReclaimStale returns orphaned jobs back to pending and reports how many. A
+// job is orphaned when its claim lease has expired; jobs without a recorded
+// expiry (legacy state) fall back to the StartedAt-based timeout. A timeout
+// <= 0 falls back to the queue's configured staleAfter (5 minutes by
+// default), matching pgq semantics.
 func (m *Mem) ReclaimStale(_ context.Context, timeout time.Duration) (int64, error) {
 	if timeout <= 0 {
 		timeout = m.staleAfter
@@ -220,23 +305,33 @@ func (m *Mem) ReclaimStale(_ context.Context, timeout time.Duration) (int64, err
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	cutoff := time.Now().UTC().Add(-timeout)
+	now := m.now()
+	cutoff := now.Add(-timeout) // legacy fallback horizon only
 	var count int64
 
 	for _, j := range m.jobs {
 		if j.Status != jobq.Processing {
 			continue
 		}
-		if j.StartedAt == nil {
+
+		stale := false
+		if until, ok := m.leaseUntil[j.ID]; ok {
+			stale = !until.After(now) // lease expired → orphaned, like pgq
+		} else if j.StartedAt != nil { // legacy: no lease recorded
+			stale = j.StartedAt.Before(cutoff)
+		}
+
+		if !stale {
 			continue
 		}
-		if j.StartedAt.Before(cutoff) {
-			j.Status = jobq.Pending
-			j.StartedAt = nil
-			j.Error = ""
-			delete(m.retryAt, j.ID) // reclaimed jobs become claimable immediately
-			count++
-		}
+
+		j.Status = jobq.Pending
+		j.StartedAt = nil
+		j.Error = ""
+
+		delete(m.retryAt, j.ID) // reclaimed jobs become claimable immediately
+		delete(m.leaseUntil, j.ID)
+		count++
 	}
 
 	return count, nil
@@ -270,7 +365,7 @@ func (m *Mem) Depth(_ context.Context) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	now := time.Now().UTC()
+	now := m.now()
 	var n int
 	for _, j := range m.jobs {
 		if j.Status != jobq.Pending || j.Attempts >= m.maxAttempts {

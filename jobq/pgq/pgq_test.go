@@ -249,38 +249,43 @@ func TestConfig_WithDefaults(t *testing.T) {
 		wantStale time.Duration
 		wantBase  time.Duration
 		wantCap   time.Duration
+		wantLease time.Duration
 	}{{
 		name:      "zero",
 		in:        Config{},
-		wantTable: "jobq_jobs", wantMax: 3, wantStale: 5 * time.Minute, wantBase: 0, wantCap: 0,
+		wantTable: "jobq_jobs", wantMax: 3, wantStale: 5 * time.Minute, wantBase: 0, wantCap: 0, wantLease: 5 * time.Minute,
 	}, {
 		name:      "custom table",
 		in:        Config{Table: "my_jobs"},
-		wantTable: "my_jobs", wantMax: 3, wantStale: 5 * time.Minute, wantBase: 0, wantCap: 0,
+		wantTable: "my_jobs", wantMax: 3, wantStale: 5 * time.Minute, wantBase: 0, wantCap: 0, wantLease: 5 * time.Minute,
 	}, {
 		name:      "custom max",
 		in:        Config{MaxAttempts: 7},
-		wantTable: "jobq_jobs", wantMax: 7, wantStale: 5 * time.Minute, wantBase: 0, wantCap: 0,
+		wantTable: "jobq_jobs", wantMax: 7, wantStale: 5 * time.Minute, wantBase: 0, wantCap: 0, wantLease: 5 * time.Minute,
 	}, {
 		name:      "custom stale",
 		in:        Config{StaleAfter: time.Second},
-		wantTable: "jobq_jobs", wantMax: 3, wantStale: time.Second, wantBase: 0, wantCap: 0,
+		wantTable: "jobq_jobs", wantMax: 3, wantStale: time.Second, wantBase: 0, wantCap: 0, wantLease: time.Second,
 	}, {
 		name:      "neg max -> default",
 		in:        Config{MaxAttempts: -1},
-		wantTable: "jobq_jobs", wantMax: 3, wantStale: 5 * time.Minute, wantBase: 0, wantCap: 0,
+		wantTable: "jobq_jobs", wantMax: 3, wantStale: 5 * time.Minute, wantBase: 0, wantCap: 0, wantLease: 5 * time.Minute,
 	}, {
 		name:      "neg stale -> default",
 		in:        Config{StaleAfter: -time.Second},
-		wantTable: "jobq_jobs", wantMax: 3, wantStale: 5 * time.Minute, wantBase: 0, wantCap: 0,
+		wantTable: "jobq_jobs", wantMax: 3, wantStale: 5 * time.Minute, wantBase: 0, wantCap: 0, wantLease: 5 * time.Minute,
 	}, {
 		name:      "custom backoff",
 		in:        Config{RetryBase: 250 * time.Millisecond, RetryCap: 2 * time.Second},
-		wantTable: "jobq_jobs", wantMax: 3, wantStale: 5 * time.Minute, wantBase: 250 * time.Millisecond, wantCap: 2 * time.Second,
+		wantTable: "jobq_jobs", wantMax: 3, wantStale: 5 * time.Minute, wantBase: 250 * time.Millisecond, wantCap: 2 * time.Second, wantLease: 5 * time.Minute,
 	}, {
 		name:      "neg backoff -> default",
 		in:        Config{RetryBase: -time.Second, RetryCap: -time.Second},
-		wantTable: "jobq_jobs", wantMax: 3, wantStale: 5 * time.Minute, wantBase: 0, wantCap: 0,
+		wantTable: "jobq_jobs", wantMax: 3, wantStale: 5 * time.Minute, wantBase: 0, wantCap: 0, wantLease: 5 * time.Minute,
+	}, {
+		name:      "custom lease",
+		in:        Config{StaleAfter: time.Minute, Lease: 2 * time.Second},
+		wantTable: "jobq_jobs", wantMax: 3, wantStale: time.Minute, wantBase: 0, wantCap: 0, wantLease: 2 * time.Second,
 	}}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -290,6 +295,7 @@ func TestConfig_WithDefaults(t *testing.T) {
 			require.Equal(t, tc.wantStale, got.StaleAfter)
 			require.Equal(t, tc.wantBase, got.RetryBase)
 			require.Equal(t, tc.wantCap, got.RetryCap)
+			require.Equal(t, tc.wantLease, got.Lease)
 		})
 	}
 }
@@ -332,9 +338,9 @@ func TestMigration_Schema(t *testing.T) {
 
 	var n int
 	// Verify expected columns exist in the core table.
-	q := `SELECT count(*) FROM information_schema.columns WHERE table_name='jobq_jobs' AND column_name IN ('id','key','payload','status','attempts','max_attempts','error','created_at','started_at','finished_at','run_after')`
+	q := `SELECT count(*) FROM information_schema.columns WHERE table_name='jobq_jobs' AND column_name IN ('id','key','payload','status','attempts','max_attempts','error','created_at','started_at','finished_at','run_after','lease_until')`
 	require.NoError(t, db.QueryRowContext(ctx, q).Scan(&n))
-	require.Equal(t, 11, n)
+	require.Equal(t, 12, n)
 	// Verify constraint and index.
 	err = db.QueryRowContext(ctx, `SELECT count(*) FROM pg_constraint WHERE conname='jobq_jobs_status_chk'`).Scan(&n)
 	require.NoError(t, err)
@@ -566,8 +572,10 @@ func TestReclaimStale(t *testing.T) {
 	freshJob, err := q.Claim(ctx)
 	require.NoError(t, err)
 
-	// Age the stale job.
-	_, err = db.ExecContext(ctx, fmt.Sprintf("UPDATE %s SET started_at = now() - interval '10 minutes' WHERE id=$1", q.table), staleJob.ID)
+	// Age the stale job: both started_at and the lease must be in the past,
+	// otherwise the fresh lease (now + Lease) would keep it un-reclaimable.
+	_, err = db.ExecContext(ctx, fmt.Sprintf(
+		"UPDATE %s SET started_at = now() - interval '10 minutes', lease_until = now() - interval '10 minutes' WHERE id=$1", q.table), staleJob.ID)
 	require.NoError(t, err)
 
 	reclaimed, err := q.ReclaimStale(ctx, 5*time.Minute)
@@ -842,4 +850,72 @@ func TestMetrics(t *testing.T) {
 	mfs, err = reg.Gather()
 	require.NoError(t, err)
 	require.Equal(t, 1.0, gaugeValue(mfs, "jobq_jobs_by_status", q.table, "pending"))
+}
+
+func TestHeartbeat_PreventsReclaim(t *testing.T) {
+	q, db := newQueue(t, Config{StaleAfter: 150 * time.Millisecond, Lease: 300 * time.Millisecond})
+	ctx := context.Background()
+
+	ok, err := q.Enqueue(ctx, "long", nil)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	job, err := q.Claim(ctx)
+	require.NoError(t, err)
+
+	// StaleAfter has passed, but the lease is still active: not reclaimed.
+	time.Sleep(200 * time.Millisecond)
+	n, err := q.ReclaimStale(ctx, 150*time.Millisecond)
+	require.NoError(t, err)
+	require.EqualValues(t, 0, n)
+	require.Equal(t, jobq.Processing, rowStatus(t, db, q.table, job.ID))
+
+	// Heartbeat renews the lease: still not reclaimed after another StaleAfter.
+	require.NoError(t, q.Heartbeat(ctx, job.ID))
+	time.Sleep(200 * time.Millisecond)
+	n, err = q.ReclaimStale(ctx, 150*time.Millisecond)
+	require.NoError(t, err)
+	require.EqualValues(t, 0, n)
+
+	// Without a heartbeat the lease expires and the job is reclaimed.
+	time.Sleep(400 * time.Millisecond)
+	n, err = q.ReclaimStale(ctx, 150*time.Millisecond)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, n)
+	require.Equal(t, jobq.Pending, rowStatus(t, db, q.table, job.ID))
+}
+
+func TestHeartbeat_NotProcessing(t *testing.T) {
+	q, db := newQueue(t, Config{Lease: 100 * time.Millisecond})
+	ctx := context.Background()
+
+	ok, err := q.Enqueue(ctx, "h", nil)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	var id int64
+	require.NoError(t, db.QueryRowContext(ctx, fmt.Sprintf("SELECT id FROM %s WHERE key='h'", q.table)).Scan(&id))
+
+	// Pending job: heartbeat fails.
+	err = q.Heartbeat(ctx, id)
+	require.ErrorIs(t, err, ErrNotProcessing)
+
+	// After claim the heartbeat works.
+	job, err := q.Claim(ctx)
+	require.NoError(t, err)
+	require.NoError(t, q.Heartbeat(ctx, job.ID))
+
+	// After the lease expires, heartbeat fails (job still processing).
+	time.Sleep(200 * time.Millisecond)
+	err = q.Heartbeat(ctx, job.ID)
+	require.ErrorIs(t, err, ErrNotProcessing)
+
+	// Done job: heartbeat fails.
+	require.NoError(t, q.Ack(ctx, job.ID))
+	err = q.Heartbeat(ctx, job.ID)
+	require.ErrorIs(t, err, ErrNotProcessing)
+
+	// Unknown id: heartbeat fails.
+	err = q.Heartbeat(ctx, 999999)
+	require.ErrorIs(t, err, ErrNotProcessing)
 }

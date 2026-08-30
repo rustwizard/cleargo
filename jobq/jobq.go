@@ -57,6 +57,11 @@ type Queue interface {
 	// через Config.RetryBase/RetryCap, memq — через SetRetryBase.
 	Fail(ctx context.Context, id int64, errMsg string) error
 
+	// Heartbeat продлевает аренду (lease) задачи в processing, чтобы
+	// ReclaimStale не отобрал её у живого воркера. Возвращает ErrNotProcessing,
+	// если задача не в processing или аренда уже истекла.
+	Heartbeat(ctx context.Context, id int64) error
+
 	// ReclaimStale возвращает в pending задачи, зависшие в processing
 	// дольше timeout (воркер упал / OOM / kill). Возвращает число затронутых строк.
 	// timeout <= 0 означает «использовать дефолтный порог реализации»
