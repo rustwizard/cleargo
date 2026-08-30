@@ -919,3 +919,41 @@ func TestHeartbeat_NotProcessing(t *testing.T) {
 	err = q.Heartbeat(ctx, 999999)
 	require.ErrorIs(t, err, ErrNotProcessing)
 }
+
+func TestClaim_SetsLease(t *testing.T) {
+	q, db := newQueue(t, Config{Lease: time.Minute})
+	ctx := context.Background()
+
+	ok, err := q.Enqueue(ctx, "leased", nil)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	job, err := q.Claim(ctx)
+	require.NoError(t, err)
+
+	var active bool
+	err = db.QueryRowContext(ctx, fmt.Sprintf("SELECT lease_until > now() FROM %s WHERE id=$1", q.table), job.ID).Scan(&active)
+	require.NoError(t, err)
+	require.True(t, active, "claimed job must hold a future lease")
+}
+
+func TestHeartbeat_RenewsLease(t *testing.T) {
+	q, db := newQueue(t, Config{Lease: 5 * time.Minute})
+	ctx := context.Background()
+
+	_, _ = q.Enqueue(ctx, "hb", nil)
+	job, err := q.Claim(ctx)
+	require.NoError(t, err)
+
+	var before float64
+	err = db.QueryRowContext(ctx, fmt.Sprintf("SELECT extract(epoch from lease_until) FROM %s WHERE id=$1", q.table), job.ID).Scan(&before)
+	require.NoError(t, err)
+
+	time.Sleep(30 * time.Millisecond)
+	require.NoError(t, q.Heartbeat(ctx, job.ID))
+
+	var after float64
+	err = db.QueryRowContext(ctx, fmt.Sprintf("SELECT extract(epoch from lease_until) FROM %s WHERE id=$1", q.table), job.ID).Scan(&after)
+	require.NoError(t, err)
+	require.Greater(t, after, before, "heartbeat must push lease_until forward")
+}
