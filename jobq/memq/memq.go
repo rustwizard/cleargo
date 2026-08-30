@@ -10,6 +10,7 @@ import (
 	"errors"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/rustwizard/cleargo/jobq"
 )
@@ -25,20 +26,30 @@ type Mem struct {
 	keys        map[string]int64 // key → id, for idempotency
 	nextID      int64
 	maxAttempts int
+	staleAfter  time.Duration
 }
 
 // New creates an in-memory queue. maxAttempts is stamped onto every job
 // at enqueue time, matching the Postgres implementation. A value <= 0
 // defaults to 3.
-func New(maxAttempts int) *Mem {
+//
+// Optional staleAfter overrides the default orphan timeout used by
+// ReclaimStale when called with timeout <= 0 (default: 5 minutes),
+// matching pgq.Config.StaleAfter semantics.
+func New(maxAttempts int, staleAfter ...time.Duration) *Mem {
 	if maxAttempts <= 0 {
 		maxAttempts = 3
+	}
+	sa := 5 * time.Minute
+	if len(staleAfter) > 0 && staleAfter[0] > 0 {
+		sa = staleAfter[0]
 	}
 	return &Mem{
 		jobs:        make(map[int64]*jobq.Job),
 		keys:        make(map[string]int64),
 		nextID:      1,
 		maxAttempts: maxAttempts,
+		staleAfter:  sa,
 	}
 }
 
@@ -141,9 +152,10 @@ func (m *Mem) Ack(_ context.Context, id int64) error {
 // Fail records an error. If attempts < maxAttempts the job returns to
 // pending for retry; otherwise it transitions to the terminal "failed" state.
 // Returns ErrNotProcessing if the job is not currently in processing state.
+// The error message is truncated to 2000 runes, matching pgq.
 func (m *Mem) Fail(_ context.Context, id int64, errMsg string) error {
-	if len(errMsg) > 2000 {
-		errMsg = errMsg[:2000]
+	if utf8.RuneCountInString(errMsg) > 2000 {
+		errMsg = string([]rune(errMsg)[:2000])
 	}
 
 	m.mu.Lock()
@@ -174,10 +186,11 @@ func (m *Mem) Fail(_ context.Context, id int64, errMsg string) error {
 
 // ReclaimStale returns processing jobs whose StartedAt is older than timeout
 // back to pending. Returns the number of reclaimed jobs.
-// A timeout <= 0 reclaims nothing (returns 0, nil).
+// A timeout <= 0 falls back to the queue's configured staleAfter (5 minutes
+// by default), matching pgq semantics.
 func (m *Mem) ReclaimStale(_ context.Context, timeout time.Duration) (int64, error) {
 	if timeout <= 0 {
-		return 0, nil
+		timeout = m.staleAfter
 	}
 
 	m.mu.Lock()
@@ -202,6 +215,42 @@ func (m *Mem) ReclaimStale(_ context.Context, timeout time.Duration) (int64, err
 	}
 
 	return count, nil
+}
+
+// Stats returns the number of jobs per status.
+func (m *Mem) Stats(_ context.Context) (jobq.Stats, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var s jobq.Stats
+	for _, j := range m.jobs {
+		switch j.Status {
+		case jobq.Pending:
+			s.Pending++
+		case jobq.Processing:
+			s.Processing++
+		case jobq.Done:
+			s.Done++
+		case jobq.Failed:
+			s.Failed++
+		}
+	}
+	return s, nil
+}
+
+// Depth returns the number of jobs Claim can hand out right now
+// (pending and not yet exhausted their attempts), matching Claim's logic.
+func (m *Mem) Depth(_ context.Context) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var n int
+	for _, j := range m.jobs {
+		if j.Status == jobq.Pending && j.Attempts < m.maxAttempts {
+			n++
+		}
+	}
+	return n, nil
 }
 
 // ---------------------------------------------------------------------------

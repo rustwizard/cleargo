@@ -13,9 +13,13 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/rustwizard/cleargo/jobq"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
@@ -38,8 +42,13 @@ func TestMain(m *testing.M) {
 	// Parse flags first; testing.Short() panics otherwise.
 	flag.Parse()
 
-	// Start a shared container unless running in short mode.
-	if !testing.Short() {
+	// Allow running integration tests against an external Postgres
+	// (e.g. in CI) without Docker: PGQ_TEST_DSN=postgres://user:pass@host:5432/db
+	if dsn := os.Getenv("PGQ_TEST_DSN"); dsn != "" {
+		sharedDSN = dsn
+		fmt.Fprintf(os.Stderr, "pgq: using external postgres from PGQ_TEST_DSN\n")
+	} else if !testing.Short() {
+		// Start a shared container unless running in short mode.
 		dsn, cleanup, err := startSharedPostgres(context.Background())
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "pgq: shared postgres unavailable (%v); integration tests will be skipped\n", err)
@@ -187,6 +196,9 @@ func rowStatus(t *testing.T, db *sql.DB, table string, id int64) jobq.Status {
 type noopDB struct{}
 
 func (noopDB) ExecContext(context.Context, string, ...any) (sql.Result, error) {
+	return nil, errors.New("not implemented")
+}
+func (noopDB) QueryContext(context.Context, string, ...any) (*sql.Rows, error) {
 	return nil, errors.New("not implemented")
 }
 func (noopDB) QueryRowContext(context.Context, string, ...any) *sql.Row { return nil }
@@ -399,15 +411,27 @@ func TestFail_RetryThenTerminal(t *testing.T) {
 func TestFail_Truncation(t *testing.T) {
 	q, db := newQueue(t, Config{MaxAttempts: 1})
 	ctx := context.Background()
+
+	// ASCII payload: truncated to exactly 2000 chars.
 	_, _ = q.Enqueue(ctx, "long-err", nil)
 	job, err := q.Claim(ctx)
 	require.NoError(t, err)
-	long := strings.Repeat("x", 3000)
-	require.NoError(t, q.Fail(ctx, job.ID, long))
+	require.NoError(t, q.Fail(ctx, job.ID, strings.Repeat("x", 3000)))
 	var stored string
 	err = db.QueryRowContext(ctx, fmt.Sprintf("SELECT error FROM %s WHERE id=$1", q.table), job.ID).Scan(&stored)
 	require.NoError(t, err)
 	require.Len(t, stored, 2000)
+
+	// Cyrillic payload: truncation must not cut a multibyte rune in half.
+	_, _ = q.Enqueue(ctx, "long-err-cyr", nil)
+	job, err = q.Claim(ctx)
+	require.NoError(t, err)
+	cyr := strings.Repeat("й", 3000) // 2 bytes per rune
+	require.NoError(t, q.Fail(ctx, job.ID, cyr))
+	err = db.QueryRowContext(ctx, fmt.Sprintf("SELECT error FROM %s WHERE id=$1", q.table), job.ID).Scan(&stored)
+	require.NoError(t, err)
+	require.Equal(t, 2000, utf8.RuneCountInString(stored), "exactly 2000 runes, no broken UTF-8")
+	require.True(t, utf8.ValidString(stored), "stored error must be valid UTF-8")
 }
 
 func TestAck_NotProcessing(t *testing.T) {
@@ -611,4 +635,122 @@ func TestConcurrent_MixedOps(t *testing.T) {
 	require.NoError(t, db.QueryRowContext(ctx, fmt.Sprintf("SELECT count(*) FROM %s WHERE status='failed'", q.table)).Scan(&failed))
 	require.NoError(t, db.QueryRowContext(ctx, fmt.Sprintf("SELECT count(*) FROM %s WHERE status='pending'", q.table)).Scan(&pending))
 	require.Equal(t, enqueues, done+failed+pending)
+}
+
+func TestStats(t *testing.T) {
+	q, _ := newQueue(t, Config{MaxAttempts: 2})
+	ctx := context.Background()
+
+	// Empty queue.
+	st, err := q.Stats(ctx)
+	require.NoError(t, err)
+	require.Equal(t, jobq.Stats{}, st)
+	depth, err := q.Depth(ctx)
+	require.NoError(t, err)
+	require.Zero(t, depth)
+
+	// Three pending.
+	for _, k := range []string{"s1", "s2", "s3"} {
+		ok, err := q.Enqueue(ctx, k, nil)
+		require.NoError(t, err)
+		require.True(t, ok)
+	}
+	st, err = q.Stats(ctx)
+	require.NoError(t, err)
+	require.Equal(t, jobq.Stats{Pending: 3}, st)
+	depth, err = q.Depth(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 3, depth)
+
+	// Claim one -> processing, depth shrinks.
+	job, err := q.Claim(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "s1", job.Key)
+	st, err = q.Stats(ctx)
+	require.NoError(t, err)
+	require.Equal(t, jobq.Stats{Pending: 2, Processing: 1}, st)
+	depth, err = q.Depth(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 2, depth)
+
+	// Ack it -> done.
+	require.NoError(t, q.Ack(ctx, job.ID))
+	st, err = q.Stats(ctx)
+	require.NoError(t, err)
+	require.Equal(t, jobq.Stats{Pending: 2, Done: 1}, st)
+
+	// Exhaust attempts of s2 (maxAttempts=2): claim, fail, claim, fail.
+	for i := 0; i < 2; i++ {
+		job, err = q.Claim(ctx)
+		require.NoError(t, err)
+		require.Equal(t, "s2", job.Key)
+		require.NoError(t, q.Fail(ctx, job.ID, "boom"))
+	}
+	st, err = q.Stats(ctx)
+	require.NoError(t, err)
+	require.Equal(t, jobq.Stats{Pending: 1, Done: 1, Failed: 1}, st)
+	depth, err = q.Depth(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 1, depth)
+}
+
+// gaugeValue returns the value of a gauge metric matching name+labels
+// from gathered metric families, or -1 when absent.
+func gaugeValue(mfs []*dto.MetricFamily, name, table, status string) float64 {
+	for _, mf := range mfs {
+		if mf.GetName() != name {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			var gotTable, gotStatus string
+			for _, lp := range m.GetLabel() {
+				switch lp.GetName() {
+				case "table":
+					gotTable = lp.GetValue()
+				case "status":
+					gotStatus = lp.GetValue()
+				}
+			}
+			if gotTable == table && gotStatus == status {
+				return m.GetGauge().GetValue()
+			}
+		}
+	}
+	return -1
+}
+
+func TestMetrics(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	q, _ := newQueue(t, Config{Metrics: reg})
+	ctx := context.Background()
+
+	_, _ = q.Enqueue(ctx, "a", nil)
+	_, _ = q.Enqueue(ctx, "b", nil)
+	job, err := q.Claim(ctx) // a -> processing
+	require.NoError(t, err)
+	require.NoError(t, q.Ack(ctx, job.ID))
+	job, err = q.Claim(ctx) // b -> processing
+	require.NoError(t, err)
+	require.NoError(t, q.Ack(ctx, job.ID))
+	_, err = q.Claim(ctx) // drained
+	require.ErrorIs(t, err, jobq.ErrNoJobs)
+
+	// Operation counters (updated synchronously).
+	require.Equal(t, 2.0, testutil.ToFloat64(q.metrics.opsTotal.WithLabelValues(q.table, "enqueue")))
+	require.Equal(t, 2.0, testutil.ToFloat64(q.metrics.opsTotal.WithLabelValues(q.table, "claim")))
+	require.Equal(t, 2.0, testutil.ToFloat64(q.metrics.opsTotal.WithLabelValues(q.table, "ack")))
+
+	// Depth gauges are refreshed on scrape: pending=0, done=2.
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+	require.Equal(t, 0.0, gaugeValue(mfs, "jobq_jobs_by_status", q.table, "pending"))
+	require.Equal(t, 2.0, gaugeValue(mfs, "jobq_jobs_by_status", q.table, "done"))
+	require.Equal(t, 0.0, gaugeValue(mfs, "jobq_jobs_by_status", q.table, "processing"))
+	require.Equal(t, 0.0, gaugeValue(mfs, "jobq_jobs_by_status", q.table, "failed"))
+
+	// A second scrape reflects a new state (one pending again).
+	_, _ = q.Enqueue(ctx, "c", nil)
+	mfs, err = reg.Gather()
+	require.NoError(t, err)
+	require.Equal(t, 1.0, gaugeValue(mfs, "jobq_jobs_by_status", q.table, "pending"))
 }

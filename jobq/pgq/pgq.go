@@ -4,7 +4,7 @@
 // The target table must exist before calling New(). Apply the embedded
 // migrations first:
 //
-//	_, err := pgq.Migrate(ctx, pool)
+//	_, err := pgq.Migrate(ctx, dsn, 30*time.Second)
 //
 // The module does NOT auto-migrate on New().
 package pgq
@@ -16,13 +16,18 @@ import (
 	"errors"
 	"fmt"
 	"time"
+	"unicode/utf8"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/rustwizard/cleargo/jobq"
 )
 
-// DB is the minimal interface satisfied by both *sql.DB and pgxpool.Pool.
+// DB is the minimal interface satisfied by *sql.DB (and compatible
+// database/sql drivers, e.g. pgx stdlib). pgxpool.Pool needs a thin adapter
+// because its methods return pgx-native types.
 type DB interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
@@ -40,6 +45,16 @@ type Config struct {
 	// A job stuck in "processing" longer than this is considered orphaned.
 	// Default: 5 * time.Minute.
 	StaleAfter time.Duration
+
+	// Metrics is a Prometheus registerer for queue metrics. When non-nil the
+	// queue registers a collector exposing:
+	//
+	//	jobq_ops_total{table,op}            — counter of operations
+	//	jobq_jobs_by_status{table,status}   — gauge, refreshed on scrape
+	//
+	// All queues sharing one registerer must use distinct tables; the table
+	// label keeps their series apart. Nil disables metrics.
+	Metrics prometheus.Registerer
 }
 
 func (c Config) withDefaults() Config {
@@ -61,23 +76,38 @@ type Postgres struct {
 	table       string // validated, safe to interpolate
 	maxAttempts int
 	staleAfter  time.Duration
+	metrics     *queueMetrics // nil when metrics are disabled
 }
 
 // New creates a Postgres queue. It does NOT verify that the table exists;
 // call Migrate or ensure your migration has run before first use.
 func New(db DB, cfg Config) (*Postgres, error) {
+	if db == nil {
+		return nil, errors.New("pgq: db must not be nil")
+	}
+
 	cfg = cfg.withDefaults()
 
 	if err := validateTableName(cfg.Table); err != nil {
 		return nil, fmt.Errorf("pgq: %w", err)
 	}
 
-	return &Postgres{
+	q := &Postgres{
 		db:          db,
 		table:       cfg.Table,
 		maxAttempts: cfg.MaxAttempts,
 		staleAfter:  cfg.StaleAfter,
-	}, nil
+	}
+
+	if cfg.Metrics != nil {
+		m, err := registerQueueMetrics(cfg.Metrics, q)
+		if err != nil {
+			return nil, fmt.Errorf("pgq: register metrics: %w", err)
+		}
+		q.metrics = m
+	}
+
+	return q, nil
 }
 
 // StaleAfter returns the configured orphan timeout. Useful for callers that
@@ -111,6 +141,9 @@ func (p *Postgres) Enqueue(ctx context.Context, key string, payload map[string]a
 	}
 
 	n, _ := res.RowsAffected()
+	if n > 0 {
+		p.incOp("enqueue")
+	}
 	return n > 0, nil
 }
 
@@ -152,6 +185,7 @@ func (p *Postgres) Claim(ctx context.Context) (*jobq.Job, error) {
 	if err != nil {
 		return nil, fmt.Errorf("pgq: claim: %w", err)
 	}
+	p.incOp("claim")
 
 	var payload map[string]any
 	if len(payloadBytes) > 0 {
@@ -190,6 +224,7 @@ func (p *Postgres) Ack(ctx context.Context, id int64) error {
 	if n == 0 {
 		return fmt.Errorf("pgq: ack job %d: %w", id, ErrNotProcessing)
 	}
+	p.incOp("ack")
 	return nil
 }
 
@@ -198,9 +233,10 @@ func (p *Postgres) Ack(ctx context.Context, id int64) error {
 // to the terminal "failed" state.
 //
 // The error message is truncated to 2000 characters to keep the table tidy.
+// Truncation is rune-safe so multibyte (e.g. Cyrillic) text is never cut mid-rune.
 func (p *Postgres) Fail(ctx context.Context, id int64, errMsg string) error {
-	if len(errMsg) > 2000 {
-		errMsg = errMsg[:2000]
+	if utf8.RuneCountInString(errMsg) > 2000 {
+		errMsg = string([]rune(errMsg)[:2000])
 	}
 
 	res, err := p.db.ExecContext(ctx, `
@@ -219,6 +255,7 @@ func (p *Postgres) Fail(ctx context.Context, id int64, errMsg string) error {
 	if n == 0 {
 		return fmt.Errorf("pgq: fail job %d: %w", id, ErrNotProcessing)
 	}
+	p.incOp("fail")
 	return nil
 }
 
@@ -249,7 +286,65 @@ func (p *Postgres) ReclaimStale(ctx context.Context, timeout time.Duration) (int
 	}
 
 	n, _ := res.RowsAffected()
+	if n > 0 {
+		p.incOp("reclaim")
+	}
 	return n, nil
+}
+
+// Stats returns the number of jobs per status at the moment of the query.
+func (p *Postgres) Stats(ctx context.Context) (jobq.Stats, error) {
+	rows, err := p.db.QueryContext(ctx, `
+		SELECT status, count(*) FROM `+p.table+` GROUP BY status
+	`)
+	if err != nil {
+		return jobq.Stats{}, fmt.Errorf("pgq: stats: %w", err)
+	}
+	defer rows.Close()
+
+	var s jobq.Stats
+	for rows.Next() {
+		var st jobq.Status
+		var n int
+		if err := rows.Scan(&st, &n); err != nil {
+			return jobq.Stats{}, fmt.Errorf("pgq: stats: %w", err)
+		}
+		switch st {
+		case jobq.Pending:
+			s.Pending = n
+		case jobq.Processing:
+			s.Processing = n
+		case jobq.Done:
+			s.Done = n
+		case jobq.Failed:
+			s.Failed = n
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return jobq.Stats{}, fmt.Errorf("pgq: stats: %w", err)
+	}
+	return s, nil
+}
+
+// Depth returns the number of jobs Claim can hand out right now
+// (pending and not yet exhausted their attempts).
+func (p *Postgres) Depth(ctx context.Context) (int, error) {
+	var n int
+	err := p.db.QueryRowContext(ctx, `
+		SELECT count(*) FROM `+p.table+`
+		WHERE status = 'pending' AND attempts < max_attempts
+	`).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("pgq: depth: %w", err)
+	}
+	return n, nil
+}
+
+// incOp bumps the per-table operation counter when metrics are enabled.
+func (p *Postgres) incOp(op string) {
+	if p.metrics != nil {
+		p.metrics.opsTotal.WithLabelValues(p.table, op).Inc()
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -266,7 +361,8 @@ func validateTableName(name string) error {
 	if name == "" {
 		return errors.New("table name must not be empty")
 	}
-	if len(name) > 63 {
+	// PostgreSQL limits identifiers to 63 *characters*, not bytes.
+	if utf8.RuneCountInString(name) > 63 {
 		return fmt.Errorf("table name %q exceeds 63 characters", name)
 	}
 	for i, c := range name {
